@@ -4,8 +4,8 @@ import numpy as np
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
-# States (as in the paper)
-UNBURNABLE = 0  # cannot be burned
+# States (as in the paper, Section 2.1)
+UNBURNABLE = 0  # cannot be burned  (e.g. water, rock)
 UNIGNITED  = 1  # has not been ignited
 BURNING    = 2  # burning
 BURNED     = 3  # has been burned
@@ -14,12 +14,12 @@ BURNED     = 3  # has been burned
 @dataclass
 class Wind:
     """
-    Wind settings. The paper decomposes wind to 8 directions using cos terms.
-    We'll represent direction as degrees where 0 = North, 90 = East (common in GIS),
-    but you can adapt if your project uses a different convention.
+    Wind settings.  The paper (Section 2.2) decomposes wind to 8 directions
+    using projected components V·cos(δ).
+    direction_deg: compass direction wind blows TOWARDS (0 = N, 90 = E).
     """
     speed_mps: float
-    direction_deg: float  # direction wind is blowing TOWARDS (meteorology vs GIS may differ)
+    direction_deg: float
 
 
 def _dir_to_unit_vectors_8() -> Tuple[Tuple[int, int], ...]:
@@ -128,15 +128,44 @@ class CAConfig:
     wind: Wind = field(default_factory=lambda: Wind(speed_mps=2.0, direction_deg=90.0))
 
 
+def compute_slope_factor(slope_deg: np.ndarray) -> np.ndarray:
+    """
+    Paper Eq. (18): K_phi = exp(3.533 * (tan(phi))^1.2)
+    where phi is the terrain slope angle in degrees.
+    Clamp to avoid extreme values on very steep terrain.
+    """
+    phi_rad = np.radians(np.clip(slope_deg, 0.0, 75.0))
+    tan_phi = np.tan(phi_rad)
+    k_phi = np.exp(3.533 * np.power(np.clip(tan_phi, 0.0, 5.0), 1.2))
+    # Normalise so flat terrain has factor 1.0
+    k_phi = k_phi / k_phi.min() if k_phi.min() > 0 else k_phi
+    return k_phi.astype(np.float32)
+
+
 class ForestFireCA:
     """
-    Implements the paper's CA update rules:
-      - 4 states
-      - Moore neighborhood
-      - ignition occurs if (has burning neighbor) and (P > e)
-      - P = p * theta
+    Implements the LSSVM-CA update rules from the paper:
+      - 4 states (Section 2.1)
+      - Moore neighbourhood
+      - Ignition probability  P(i,j) = Pc * theta  (Eq. 16)
+        where Pc is the LSSVM-derived probability and theta the adjacent wind effect
+      - Slope factor K_phi modifies effective spread rate
+      - Random threshold e^t  (Eq. 1)
+
+    Parameters
+    ----------
+    initial_grid : ndarray (H, W) uint8
+        Cell states.
+    p_ignite : ndarray (H, W) float32
+        LSSVM-derived ignition probability Pc for each cell.
+    cfg : CAConfig
+    slope_deg : ndarray (H, W) float32, optional
+        Slope raster in degrees.  If provided, the slope factor K_phi
+        from Eq. 18 modulates the transition probability.
     """
-    def __init__(self, initial_grid: np.ndarray, p_ignite: np.ndarray, cfg: Optional[CAConfig] = None):
+    def __init__(self, initial_grid: np.ndarray, p_ignite: np.ndarray,
+                 cfg: Optional[CAConfig] = None,
+                 slope_deg: Optional[np.ndarray] = None):
         if initial_grid.shape != p_ignite.shape:
             raise ValueError("initial_grid and p_ignite must have same shape")
         self.grid = initial_grid.astype(np.uint8)
@@ -144,6 +173,12 @@ class ForestFireCA:
         self.cfg = cfg or CAConfig()
         self.rng = np.random.default_rng(self.cfg.seed)
         self.wind_weights = compute_wind_weights(self.cfg.wind)
+
+        # Slope factor (Eq. 18) — default to 1.0 if no slope data
+        if slope_deg is not None:
+            self.k_phi = compute_slope_factor(slope_deg)
+        else:
+            self.k_phi = np.ones(initial_grid.shape, dtype=np.float32)
 
     def step(self) -> np.ndarray:
         g = self.grid
@@ -158,13 +193,16 @@ class ForestFireCA:
         # need at least one burning neighbor
         has_fire_neighbor = any_burning_neighbor(g)
 
-        # compute theta from wind-weighted burning neighbors
+        # compute theta from wind-weighted burning neighbors  — Eq. (3)
         theta = compute_theta(g, self.wind_weights)  # [0..1]
 
-        # P = p * theta (paper Eq.15)
-        P = self.p * theta
+        # P(i,j) = Pc * theta * K_phi   — Eq. (16) extended with slope
+        P = self.p * theta * self.k_phi
 
-        # random threshold e^t (paper Eq.1)
+        # Clamp to [0, 1]
+        P = np.clip(P, 0.0, 1.0)
+
+        # random threshold e^t  — Eq. (1)
         e = random_threshold(self.cfg.alpha, self.cfg.beta, self.rng, g.shape)
 
         ignite = candidates & has_fire_neighbor & (P > e)
