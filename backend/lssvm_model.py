@@ -14,6 +14,7 @@ Key equations implemented:
 from __future__ import annotations
 import numpy as np
 from typing import Optional
+from pathlib import Path
 
 
 class LSSVM:
@@ -149,3 +150,43 @@ class LSSVM:
         X_flat = feature_rasters.reshape(n_features, -1).T
         Pc_flat = self.predict_proba(X_flat)
         return Pc_flat.reshape(H, W).astype(np.float32)
+
+    # ------------------------------------------------------------------
+    # Persistence — save / load trained model
+    # ------------------------------------------------------------------
+    def save(self, path: str | Path) -> None:
+        """
+        Save the trained model to a .npz file.
+        Stores all state needed to reconstruct the model and run predictions.
+        """
+        if self.alpha is None:
+            raise RuntimeError("Cannot save an untrained model — call fit() first.")
+        np.savez_compressed(
+            str(path),
+            gamma=np.array(self.gamma),
+            sigma=np.array(self.sigma),
+            b=np.array(self.b),
+            alpha=self.alpha,
+            X_train=self.X_train,
+            y_train=self.y_train,
+        )
+
+    @classmethod
+    def load(cls, path: str | Path) -> "LSSVM":
+        """
+        Load a previously saved model from a .npz file.
+        Returns a fully‐initialised LSSVM ready for prediction.
+        """
+        path = Path(path)
+        if not path.exists() and path.with_suffix(".npz").exists():
+            path = path.with_suffix(".npz")
+        data = np.load(str(path))
+        model = cls(
+            gamma=float(data["gamma"]),
+            sigma=float(data["sigma"]),
+        )
+        model.b       = float(data["b"])
+        model.alpha   = data["alpha"]
+        model.X_train = data["X_train"]
+        model.y_train = data["y_train"]
+        return model

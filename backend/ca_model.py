@@ -126,13 +126,18 @@ class CAConfig:
     beta: float = 1.0
     seed: int = 123
     wind: Wind = field(default_factory=lambda: Wind(speed_mps=2.0, direction_deg=90.0))
+    burn_duration: int = 2          # how many steps a cell stays BURNING before → BURNED
+    ignition_radius: int = 3        # radius of the initial ignition block (0 = single cell)
 
 
 def compute_slope_factor(slope_deg: np.ndarray) -> np.ndarray:
     """
     Paper Eq. (18): K_phi = exp(3.533 * (tan(phi))^1.2)
     where phi is the terrain slope angle in degrees.
-    Clamp to avoid extreme values on very steep terrain.
+
+    In the paper, K_phi modulates the rate-of-spread R (Eq. 17: t = L/R).
+    Steeper slopes → higher K_phi → faster fire advance.
+    We normalise so that flat terrain = 1.0 and steep slopes > 1.0.
     """
     phi_rad = np.radians(np.clip(slope_deg, 0.0, 75.0))
     tan_phi = np.tan(phi_rad)
@@ -147,9 +152,10 @@ class ForestFireCA:
     Implements the LSSVM-CA update rules from the paper:
       - 4 states (Section 2.1)
       - Moore neighbourhood
-      - Ignition probability  P(i,j) = Pc * theta  (Eq. 16)
+      - Ignition probability  P(i,j) = Pc * theta  (Eq. 15-16)
         where Pc is the LSSVM-derived probability and theta the adjacent wind effect
-      - Slope factor K_phi modifies effective spread rate
+      - Slope factor K_phi modulates rate-of-spread (Eq. 17-18):
+        steeper terrain → longer burn duration → fire front advances faster
       - Random threshold e^t  (Eq. 1)
 
     Parameters
@@ -161,7 +167,7 @@ class ForestFireCA:
     cfg : CAConfig
     slope_deg : ndarray (H, W) float32, optional
         Slope raster in degrees.  If provided, the slope factor K_phi
-        from Eq. 18 modulates the transition probability.
+        from Eq. 18 modulates per-cell burn duration (rate of spread).
     """
     def __init__(self, initial_grid: np.ndarray, p_ignite: np.ndarray,
                  cfg: Optional[CAConfig] = None,
@@ -174,32 +180,48 @@ class ForestFireCA:
         self.rng = np.random.default_rng(self.cfg.seed)
         self.wind_weights = compute_wind_weights(self.cfg.wind)
 
-        # Slope factor (Eq. 18) — default to 1.0 if no slope data
+        # Slope factor (Eq. 18) → modulates per-cell burn duration
+        # Paper Eq. 17:  t = L / R  where R ∝ K_phi * K_w
+        # Higher K_phi → faster spread → longer effective burn window
         if slope_deg is not None:
             self.k_phi = compute_slope_factor(slope_deg)
         else:
             self.k_phi = np.ones(initial_grid.shape, dtype=np.float32)
 
+        # Per-cell burn duration: base_duration * K_phi (capped at a max)
+        self.cell_burn_dur = np.clip(
+            (self.cfg.burn_duration * self.k_phi).astype(np.int32),
+            self.cfg.burn_duration,
+            self.cfg.burn_duration * 5,
+        )
+
+        # Burn timer: how many more steps each cell stays BURNING
+        self.burn_timer = np.zeros(initial_grid.shape, dtype=np.int32)
+        # Initialise timers for any cells that start as BURNING
+        mask = (self.grid == BURNING)
+        self.burn_timer[mask] = self.cell_burn_dur[mask]
+
     def step(self) -> np.ndarray:
         g = self.grid
-        # base deterministic transitions
         next_g = g.copy()
-        next_g[g == BURNING] = BURNED  # burning -> burned
-        # burned stays burned; unburnable stays unburnable
 
-        # candidates: unignited cells
+        # --- Burning → Burned only after per-cell burn_duration steps ---
+        burning_mask = (g == BURNING)
+        self.burn_timer[burning_mask] -= 1
+        expired = burning_mask & (self.burn_timer <= 0)
+        next_g[expired] = BURNED
+
+        # --- Ignition of unignited cells ---
         candidates = (g == UNIGNITED)
-
-        # need at least one burning neighbor
         has_fire_neighbor = any_burning_neighbor(g)
 
-        # compute theta from wind-weighted burning neighbors  — Eq. (3)
+        # compute theta from wind-weighted burning neighbors  — Eq. (16)
         theta = compute_theta(g, self.wind_weights)  # [0..1]
 
-        # P(i,j) = Pc * theta * K_phi   — Eq. (16) extended with slope
-        P = self.p * theta * self.k_phi
-
-        # Clamp to [0, 1]
+        # P(i,j) = Pc * theta   — Eq. (15-16)
+        # NOTE: K_phi is NOT in the transition probability (paper uses it
+        # in the time-step Eq. 17, not the ignition probability).
+        P = self.p * theta
         P = np.clip(P, 0.0, 1.0)
 
         # random threshold e^t  — Eq. (1)
@@ -207,6 +229,7 @@ class ForestFireCA:
 
         ignite = candidates & has_fire_neighbor & (P > e)
         next_g[ignite] = BURNING
+        self.burn_timer[ignite] = self.cell_burn_dur[ignite]
 
         self.grid = next_g
         return self.grid

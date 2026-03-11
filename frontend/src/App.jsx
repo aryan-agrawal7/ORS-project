@@ -16,6 +16,8 @@ const DEFAULT_CONFIG = {
   terrain_seed: 42,
   ignition_row_frac: 0.5,
   ignition_col_frac: 0.65,
+  burn_duration: 3,
+  ignition_radius: 3,
 };
 
 export default function App() {
@@ -112,9 +114,18 @@ export default function App() {
         <span><b>Grid:</b> {gridSize.h} × {gridSize.w}</span>
         {meta && (
           <>
-            <span title="LSSVM training time"><b>Train:</b> {meta.train_time_s}s</span>
+            <span title="LSSVM training time"><b>Train:</b> {meta.train_time_s}s ({meta.train_samples} samples)</span>
+            <span title="Overall LSSVM accuracy on training set">
+              <b>Accuracy:</b> {(meta.train_accuracy * 100).toFixed(1)}%
+              <span style={{ fontSize: 11, color: "#666" }}>
+                {" "}(fire: {(meta.fire_accuracy * 100).toFixed(1)}%, non-fire: {(meta.nofire_accuracy * 100).toFixed(1)}%)
+              </span>
+            </span>
             <span><b>Pc range:</b> [{meta.Pc_min?.toFixed(3)}, {meta.Pc_max?.toFixed(3)}]</span>
             <span><b>LSSVM b:</b> {meta.lssvm_b}</span>
+            <span title="Model source: trained = fresh, memory = in-memory cache, disk = loaded from .npz">
+              <b>Model:</b> {meta.cache === "trained" ? "🔧 trained" : meta.cache === "disk" ? "💾 disk cache" : "⚡ memory cache"}
+            </span>
           </>
         )}
       </div>
@@ -145,6 +156,10 @@ export default function App() {
             onChange={(v) => handleConfigChange("ignition_row_frac", v)} min={0} max={1} step={0.05} />
           <NumInput label="Ignition col %" value={config.ignition_col_frac}
             onChange={(v) => handleConfigChange("ignition_col_frac", v)} min={0} max={1} step={0.05} />
+          <NumInput label="Burn duration (steps)" value={config.burn_duration}
+            onChange={(v) => handleConfigChange("burn_duration", v)} min={1} max={10} step={1} />
+          <NumInput label="Ignition radius (cells)" value={config.ignition_radius}
+            onChange={(v) => handleConfigChange("ignition_radius", v)} min={0} max={10} step={1} />
         </div>
         <div style={{ marginTop: 10, display: "flex", gap: 10 }}>
           <button onClick={connect} style={btnStyle}>▶ Start / Restart</button>
