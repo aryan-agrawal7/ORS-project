@@ -11,8 +11,6 @@ const DEFAULT_CONFIG = {
   ca_alpha: 2.0,
   ca_beta: 1.0,
   ca_seed: 42,
-  wind_speed: 3.0,
-  wind_direction: 60.0,
   terrain_seed: 42,
   ignition_row_frac: 0.5,
   ignition_col_frac: 0.65,
@@ -116,16 +114,34 @@ export default function App() {
           <>
             <span title="LSSVM training time"><b>Train:</b> {meta.train_time_s}s ({meta.train_samples} samples)</span>
             <span title="Overall LSSVM accuracy on training set">
-              <b>Accuracy:</b> {(meta.train_accuracy * 100).toFixed(1)}%
+              <b>Train Acc:</b> {(meta.train_accuracy * 100).toFixed(1)}%
               <span style={{ fontSize: 11, color: "#666" }}>
                 {" "}(fire: {(meta.fire_accuracy * 100).toFixed(1)}%, non-fire: {(meta.nofire_accuracy * 100).toFixed(1)}%)
               </span>
             </span>
+            {meta.val_accuracy !== null && meta.val_accuracy !== undefined && (
+              <span title="Holdout validation metrics (20% stratified split)">
+                <b>Val:</b> acc {(meta.val_accuracy * 100).toFixed(1)}% | rec {(meta.val_recall * 100).toFixed(1)}% | f1 {(meta.val_f1 * 100).toFixed(1)}% | auc {meta.val_roc_auc?.toFixed(3)}
+              </span>
+            )}
+            {meta.val_tp !== null && meta.val_tp !== undefined && (
+              <span title="Validation confusion matrix">
+                <b>CM:</b> TP {meta.val_tp} | TN {meta.val_tn} | FP {meta.val_fp} | FN {meta.val_fn}
+              </span>
+            )}
             <span><b>Pc range:</b> [{meta.Pc_min?.toFixed(3)}, {meta.Pc_max?.toFixed(3)}]</span>
             <span><b>LSSVM b:</b> {meta.lssvm_b}</span>
             <span title="Model source: trained = fresh, memory = in-memory cache, disk = loaded from .npz">
               <b>Model:</b> {meta.cache === "trained" ? "🔧 trained" : meta.cache === "disk" ? "💾 disk cache" : "⚡ memory cache"}
             </span>
+            <span>
+              <b>Wind:</b> {meta.wind_mode === "dynamic_grib_kw" ? "🌬️ gridded hourly (GRIB-derived)" : "⚠️ constant fallback"}
+            </span>
+            {meta.wind_generation_status && meta.wind_generation_status !== "not_requested" && (
+              <span>
+                <b>Wind prep:</b> {meta.wind_generation_status}
+              </span>
+            )}
           </>
         )}
       </div>
@@ -142,10 +158,6 @@ export default function App() {
             onChange={(v) => handleConfigChange("n_train_fire", v)} min={50} max={2000} step={50} />
           <NumInput label="Training non-fire samples" value={config.n_train_nofire}
             onChange={(v) => handleConfigChange("n_train_nofire", v)} min={50} max={2000} step={50} />
-          <NumInput label="Wind speed (m/s)" value={config.wind_speed}
-            onChange={(v) => handleConfigChange("wind_speed", v)} min={0} max={20} step={0.5} />
-          <NumInput label="Wind direction (°)" value={config.wind_direction}
-            onChange={(v) => handleConfigChange("wind_direction", v)} min={0} max={359} step={5} />
           <NumInput label="CA α" value={config.ca_alpha}
             onChange={(v) => handleConfigChange("ca_alpha", v)} min={0.1} max={10} step={0.1} />
           <NumInput label="CA β" value={config.ca_beta}

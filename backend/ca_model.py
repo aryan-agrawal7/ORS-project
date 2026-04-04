@@ -1,8 +1,11 @@
 from __future__ import annotations
 import math
 import numpy as np
+import os
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
+import rasterio
+from rasterio.enums import Resampling
 
 # States (as in the paper, Section 2.1)
 UNBURNABLE = 0  # cannot be burned  (e.g. water, rock)
@@ -40,6 +43,9 @@ def _dir_to_unit_vectors_8() -> Tuple[Tuple[int, int], ...]:
     return ((-1,0), (-1,1), (0,1), (1,1), (1,0), (1,-1), (0,-1), (-1,-1))
 
 
+WIND_DIR_NAMES = ("N", "NE", "E", "SE", "S", "SW", "W", "NW")
+
+
 def _offset_to_angle_deg(di: int, dj: int) -> float:
     """
     Convert neighbor offset to compass angle in degrees where:
@@ -50,7 +56,7 @@ def _offset_to_angle_deg(di: int, dj: int) -> float:
     return (angle + 360.0) % 360.0
 
 
-def compute_wind_weights(wind: Wind) -> np.ndarray:
+def compute_wind_weights(wind: Wind) -> Dict[str, float]:
     """
     Paper Section 2.2 decomposes wind to 8 directions using projections V*cos(delta).
     Then uses Kw = exp(0.1783 * V_proj) for each direction.
@@ -97,14 +103,20 @@ def compute_theta(grid: np.ndarray, wind_weights: np.ndarray) -> np.ndarray:
 
     offsets = _dir_to_unit_vectors_8()
     num = np.zeros((h, w), dtype=np.float32)
-    den = float(np.sum(wind_weights))
+    if wind_weights.ndim == 1:
+        den = float(np.sum(wind_weights))
+    else:
+        den = np.sum(wind_weights, axis=0).astype(np.float32)
 
     for k, (di, dj) in enumerate(offsets):
-        kw = float(wind_weights[k])
+        kw = wind_weights[k]
         shifted = np.roll(np.roll(burning, di, axis=0), dj, axis=1)
         num += kw * shifted
 
-    theta = num / den
+    if isinstance(den, float):
+        theta = num / den if den > 0 else np.zeros_like(num)
+    else:
+        theta = np.divide(num, den, out=np.zeros_like(num), where=den > 0)
     return theta
 
 
@@ -171,14 +183,22 @@ class ForestFireCA:
     """
     def __init__(self, initial_grid: np.ndarray, p_ignite: np.ndarray,
                  cfg: Optional[CAConfig] = None,
-                 slope_deg: Optional[np.ndarray] = None):
+                 slope_deg: Optional[np.ndarray] = None,
+                 wind_data_dir: Optional[str] = None):
         if initial_grid.shape != p_ignite.shape:
             raise ValueError("initial_grid and p_ignite must have same shape")
         self.grid = initial_grid.astype(np.uint8)
         self.p = np.clip(p_ignite.astype(np.float32), 0.0, 1.0)
         self.cfg = cfg or CAConfig()
         self.rng = np.random.default_rng(self.cfg.seed)
+        self.wind_data_dir = wind_data_dir
+        self.step_index = 0
+        self.dynamic_wind_enabled = False
         self.wind_weights = compute_wind_weights(self.cfg.wind)
+
+        if self.wind_data_dir is not None:
+            loaded = self._load_wind_weights_for_step(0)
+            self.dynamic_wind_enabled = loaded
 
         # Slope factor (Eq. 18) → modulates per-cell burn duration
         # Paper Eq. 17:  t = L / R  where R ∝ K_phi * K_w
@@ -201,9 +221,45 @@ class ForestFireCA:
         mask = (self.grid == BURNING)
         self.burn_timer[mask] = self.cell_burn_dur[mask]
 
+    def _wind_step_dir(self, step: int) -> str:
+        return os.path.join(self.wind_data_dir, f"wind_t{step}")
+
+    def _load_wind_weights_for_step(self, step: int) -> bool:
+        """Load per-cell 8-direction wind coefficients for a step; fallback to t0."""
+        if self.wind_data_dir is None:
+            return False
+
+        candidate = self._wind_step_dir(step)
+        if not os.path.isdir(candidate):
+            candidate = self._wind_step_dir(0)
+            if not os.path.isdir(candidate):
+                return False
+
+        weights = []
+        for name in WIND_DIR_NAMES:
+            fp = os.path.join(candidate, f"kw_{name}.tif")
+            if not os.path.isfile(fp):
+                return False
+            with rasterio.open(fp) as src:
+                if (src.height, src.width) == self.grid.shape:
+                    arr = src.read(1).astype(np.float32)
+                else:
+                    arr = src.read(
+                        1,
+                        out_shape=self.grid.shape,
+                        resampling=Resampling.bilinear,
+                    ).astype(np.float32)
+            weights.append(arr)
+
+        self.wind_weights = np.stack(weights, axis=0)
+        return True
+
     def step(self) -> np.ndarray:
         g = self.grid
         next_g = g.copy()
+
+        if self.dynamic_wind_enabled:
+            self._load_wind_weights_for_step(self.step_index)
 
         # --- Burning → Burned only after per-cell burn_duration steps ---
         burning_mask = (g == BURNING)
@@ -232,4 +288,5 @@ class ForestFireCA:
         self.burn_timer[ignite] = self.cell_burn_dur[ignite]
 
         self.grid = next_g
+        self.step_index += 1
         return self.grid
