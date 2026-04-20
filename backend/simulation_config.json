@@ -1,0 +1,20 @@
+{
+  "gee_data_dir": "../data",
+  "grib_path": "../downloadeduwindvwind.grib",
+  "grid_h": 120,
+  "grid_w": 160,
+  "projected_crs": "EPSG:32648",
+  "geographic_crs": "EPSG:4326",
+  "ignition_lat": 11.71,
+  "ignition_lon": 76.58,
+  "ignition_radius": 5,
+  "lssvm_gamma": 250.0,
+  "lssvm_sigma": 0.4,
+  "ca_alpha": 2.2,
+  "ca_beta": 0.8,
+  "ca_seed": 42,
+  "burn_duration": 4,
+  "max_steps": 400,
+  "output_dir": "../outputs",
+  "output_prefix": "wildfire"
+}

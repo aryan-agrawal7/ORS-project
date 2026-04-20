@@ -1,25 +1,36 @@
 from __future__ import annotations
+
 import asyncio
 import hashlib
 import json
-import time
 import os
-import numpy as np
+import time
 from pathlib import Path
 from typing import Optional
-from fastapi import FastAPI, WebSocket
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+
+import numpy as np
+import rasterio
 import uvicorn
-from ca_model import ForestFireCA, CAConfig, UNBURNABLE, UNIGNITED, BURNING, BURNED
-from lssvm_model import LSSVM
-from data_generator import generate_terrain, generate_training_data
+from fastapi import FastAPI, HTTPException, WebSocket
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field, ValidationError
+from rasterio.crs import CRS
+from rasterio.enums import Resampling
+from rasterio.transform import array_bounds, rowcol
+from rasterio.warp import (
+    calculate_default_transform,
+    reproject,
+    transform as reproject_points,
+    transform_bounds,
+)
+
+from ca_model import BURNING, CAConfig, ForestFireCA, UNBURNABLE, UNIGNITED
 from gee_data_loader import load_gee_data
+from lssvm_model import LSSVM
 from wind_data_processor import process_wind_data
 
 app = FastAPI()
 
-# Allow local dev front-end
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173", "http://localhost:3000"],
@@ -29,66 +40,97 @@ app.add_middleware(
 )
 
 
-# ------------------------------------------------------------------
-# Pydantic models for the config API
-# ------------------------------------------------------------------
-
-class SimConfig(BaseModel):
-    grid_h: int = 120
-    grid_w: int = 160
-    # LSSVM hyper-parameters
-    lssvm_gamma: float = 100.0
-    lssvm_sigma: float = 1.0
-    n_train_fire: int = 600
-    n_train_nofire: int = 600
-    # CA parameters
-    ca_alpha: float = 2.0
-    ca_beta: float = 1.0
-    ca_seed: int = 42
-    # Terrain seed
-    terrain_seed: int = 42
-    # Ignition point (row, col)  — relative fractions of grid size
-    ignition_row_frac: float = 0.5
-    ignition_col_frac: float = 0.65
-    # Path to GEE-exported data folder (empty string = use synthetic data)
-    gee_data_dir: str = "../data/"
-    # Multi-step burning: how many CA steps a cell stays BURNING
-    burn_duration: int = 3
-    # Ignition block radius (0 = single cell, 3 = 7×7 block)
-    ignition_radius: int = 3
-
-
-# ------------------------------------------------------------------
-# Model cache — avoids retraining when only CA params change
-# ------------------------------------------------------------------
-
+CONFIG_PATH = Path(__file__).parent / "simulation_config.json"
 CACHE_DIR = Path(__file__).parent / ".model_cache"
 CACHE_DIR.mkdir(exist_ok=True)
 
 
-def _model_cache_key(cfg: SimConfig) -> str:
-    """
-    Deterministic hash of the parameters that affect LSSVM training.
-    If any of these change the model must be retrained; otherwise
-    we can reuse the saved .npz and Pc surface.
-    """
+class SimConfig(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    gee_data_dir: str = "../data"
+    grib_path: str = "../downloadeduwindvwind.grib"
+
+    grid_h: int = Field(default=120, ge=8, le=5000)
+    grid_w: int = Field(default=160, ge=8, le=5000)
+
+    projected_crs: str = "EPSG:32648"
+    geographic_crs: str = "EPSG:4326"
+
+    ignition_lat: float = Field(default=27.85, ge=-90.0, le=90.0)
+    ignition_lon: float = Field(default=102.25, ge=-180.0, le=180.0)
+    ignition_radius: int = Field(default=3, ge=0, le=50)
+
+    lssvm_gamma: float = Field(default=100.0, gt=0.0)
+    lssvm_sigma: float = Field(default=1.0, gt=0.0)
+
+    ca_alpha: float = Field(default=2.0, gt=0.0)
+    ca_beta: float = Field(default=1.0, gt=0.0)
+    ca_seed: int = 42
+    burn_duration: int = Field(default=3, ge=1, le=100)
+
+    max_steps: int = Field(default=400, ge=1, le=5000)
+
+    output_dir: str = "../outputs"
+    output_prefix: str = "wildfire"
+
+
+_mem_cache: dict[str, tuple[LSSVM, np.ndarray, dict]] = {}
+
+
+def _resolve_path(base_dir: Path, maybe_relative: str) -> Path:
+    path = Path(maybe_relative)
+    if not path.is_absolute():
+        path = (base_dir / path).resolve()
+    return path
+
+
+def _get_config_path() -> Path:
+    env_path = os.getenv("SIM_CONFIG_PATH", "").strip()
+    if env_path:
+        return Path(env_path).resolve()
+    return CONFIG_PATH
+
+
+def load_runtime_config() -> SimConfig:
+    cfg_path = _get_config_path()
+    if not cfg_path.is_file():
+        raise FileNotFoundError(f"Configuration file not found: {cfg_path}")
+
+    with cfg_path.open("r", encoding="utf-8") as fh:
+        raw = json.load(fh)
+
+    try:
+        cfg = SimConfig(**raw)
+    except ValidationError as exc:
+        raise ValueError(f"Invalid configuration in {cfg_path}: {exc}") from exc
+
+    try:
+        CRS.from_user_input(cfg.projected_crs)
+        CRS.from_user_input(cfg.geographic_crs)
+    except Exception as exc:  # pragma: no cover - rasterio errors vary by platform
+        raise ValueError(f"Invalid CRS value in config: {exc}") from exc
+
+    return cfg
+
+
+def _model_cache_key(cfg: SimConfig, data_dir: Path) -> str:
+    training_csv = data_dir / "training_samples.csv"
+    slope_tif = data_dir / "slope.tif"
     parts = (
-        "metrics_v2",
+        "georef_v1",
+        str(data_dir),
         cfg.grid_h,
         cfg.grid_w,
+        cfg.projected_crs,
+        cfg.geographic_crs,
         cfg.lssvm_gamma,
         cfg.lssvm_sigma,
-        cfg.n_train_fire,
-        cfg.n_train_nofire,
-        cfg.terrain_seed,
-        cfg.gee_data_dir,
+        training_csv.stat().st_mtime_ns if training_csv.exists() else 0,
+        slope_tif.stat().st_mtime_ns if slope_tif.exists() else 0,
     )
-    raw = json.dumps(parts, sort_keys=True).encode()
+    raw = json.dumps(parts, sort_keys=True).encode("utf-8")
     return hashlib.sha256(raw).hexdigest()[:16]
-
-
-# In-memory cache so repeated WebSocket reconnects are instant
-_mem_cache: dict[str, tuple[LSSVM, np.ndarray, dict, np.ndarray, np.ndarray]] = {}
 
 
 def _stratified_train_val_split(
@@ -97,7 +139,6 @@ def _stratified_train_val_split(
     val_ratio: float = 0.2,
     seed: int = 42,
 ) -> tuple[np.ndarray, np.ndarray, Optional[np.ndarray], Optional[np.ndarray]]:
-    """Deterministic stratified split for labels in {-1, +1}."""
     if val_ratio <= 0.0 or val_ratio >= 1.0 or len(y) < 4:
         return X, y, None, None
 
@@ -129,11 +170,10 @@ def _stratified_train_val_split(
 
 
 def _binary_roc_auc_from_scores(y_true: np.ndarray, y_score: np.ndarray) -> Optional[float]:
-    """Compute ROC-AUC for positive class (+1) using rank statistics."""
     y_true = np.asarray(y_true)
     y_score = np.asarray(y_score, dtype=np.float64)
-    pos = (y_true == 1)
-    neg = (y_true == -1)
+    pos = y_true == 1
+    neg = y_true == -1
     n_pos = int(pos.sum())
     n_neg = int(neg.sum())
     if n_pos == 0 or n_neg == 0:
@@ -149,7 +189,7 @@ def _binary_roc_auc_from_scores(y_true: np.ndarray, y_score: np.ndarray) -> Opti
         j = i
         while j + 1 < n and sorted_scores[j + 1] == sorted_scores[i]:
             j += 1
-        avg_rank = (i + j + 2) / 2.0  # 1-based ranks
+        avg_rank = (i + j + 2) / 2.0
         ranks[order[i : j + 1]] = avg_rank
         i = j + 1
 
@@ -163,7 +203,6 @@ def _classification_metrics(
     y_pred: np.ndarray,
     y_score: Optional[np.ndarray] = None,
 ) -> dict:
-    """Return confusion-matrix metrics for fire(+1) vs non-fire(-1)."""
     y_true = np.asarray(y_true)
     y_pred = np.asarray(y_pred)
 
@@ -197,155 +236,322 @@ def _classification_metrics(
     }
 
 
-# ------------------------------------------------------------------
-# Build the full LSSVM → CA pipeline
-# ------------------------------------------------------------------
+def _write_geotiff(
+    out_path: Path,
+    array: np.ndarray,
+    transform,
+    crs,
+    dtype: str,
+    nodata: Optional[float] = None,
+) -> None:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    profile = {
+        "driver": "GTiff",
+        "height": int(array.shape[0]),
+        "width": int(array.shape[1]),
+        "count": 1,
+        "dtype": dtype,
+        "crs": crs,
+        "transform": transform,
+        "compress": "lzw",
+    }
+    if nodata is not None:
+        profile["nodata"] = nodata
+
+    with rasterio.open(out_path, "w", **profile) as dst:
+        dst.write(array.astype(dtype), 1)
+
+
+def _reproject_array(
+    src_array: np.ndarray,
+    src_transform,
+    src_crs,
+    dst_crs,
+    resampling: Resampling,
+    dst_dtype,
+) -> tuple[np.ndarray, object]:
+    src_h, src_w = src_array.shape
+    left, bottom, right, top = array_bounds(src_h, src_w, src_transform)
+    dst_transform, dst_w_raw, dst_h_raw = calculate_default_transform(
+        src_crs,
+        dst_crs,
+        src_w,
+        src_h,
+        left,
+        bottom,
+        right,
+        top,
+    )
+    if dst_w_raw is None or dst_h_raw is None:
+        raise ValueError("Unable to compute destination shape for reprojection")
+    dst_w = int(dst_w_raw)
+    dst_h = int(dst_h_raw)
+
+    dst = np.empty((dst_h, dst_w), dtype=dst_dtype)
+    reproject(
+        source=src_array,
+        destination=dst,
+        src_transform=src_transform,
+        src_crs=src_crs,
+        dst_transform=dst_transform,
+        dst_crs=dst_crs,
+        resampling=resampling,
+    )
+    return dst, dst_transform
+
+
+def _export_probability_geotiffs(
+    cfg: SimConfig,
+    cache_key: str,
+    pc: np.ndarray,
+    grid_transform,
+    grid_crs,
+    backend_dir: Path,
+) -> dict:
+    out_dir = _resolve_path(backend_dir, cfg.output_dir)
+    projected_path = out_dir / f"{cfg.output_prefix}_pc_{cache_key}_projected.tif"
+    geographic_path = out_dir / f"{cfg.output_prefix}_pc_{cache_key}_geographic.tif"
+
+    _write_geotiff(
+        projected_path,
+        pc,
+        transform=grid_transform,
+        crs=grid_crs,
+        dtype="float32",
+    )
+
+    geo_pc, geo_transform = _reproject_array(
+        src_array=pc.astype(np.float32),
+        src_transform=grid_transform,
+        src_crs=grid_crs,
+        dst_crs=CRS.from_user_input(cfg.geographic_crs),
+        resampling=Resampling.bilinear,
+        dst_dtype=np.float32,
+    )
+    _write_geotiff(
+        geographic_path,
+        geo_pc,
+        transform=geo_transform,
+        crs=cfg.geographic_crs,
+        dtype="float32",
+    )
+
+    return {
+        "lssvm_pc_projected_tif": str(projected_path),
+        "lssvm_pc_geographic_tif": str(geographic_path),
+    }
+
+
+def _export_final_ca_geotiffs(
+    cfg: SimConfig,
+    cache_key: str,
+    step_idx: int,
+    grid: np.ndarray,
+    grid_transform,
+    grid_crs,
+    backend_dir: Path,
+) -> dict:
+    out_dir = _resolve_path(backend_dir, cfg.output_dir)
+    projected_path = out_dir / f"{cfg.output_prefix}_ca_final_{cache_key}_s{step_idx:04d}_projected.tif"
+    geographic_path = out_dir / f"{cfg.output_prefix}_ca_final_{cache_key}_s{step_idx:04d}_geographic.tif"
+
+    _write_geotiff(
+        projected_path,
+        grid,
+        transform=grid_transform,
+        crs=grid_crs,
+        dtype="uint8",
+        nodata=255,
+    )
+
+    geo_grid, geo_transform = _reproject_array(
+        src_array=grid.astype(np.uint8),
+        src_transform=grid_transform,
+        src_crs=grid_crs,
+        dst_crs=CRS.from_user_input(cfg.geographic_crs),
+        resampling=Resampling.nearest,
+        dst_dtype=np.uint8,
+    )
+    _write_geotiff(
+        geographic_path,
+        geo_grid,
+        transform=geo_transform,
+        crs=cfg.geographic_crs,
+        dtype="uint8",
+        nodata=255,
+    )
+
+    return {
+        "ca_final_projected_tif": str(projected_path),
+        "ca_final_geographic_tif": str(geographic_path),
+    }
+
+
+def _resolve_ignition_cell(
+    cfg: SimConfig,
+    grid_transform,
+    grid_crs,
+    shape: tuple[int, int],
+    unburnable_mask: np.ndarray,
+) -> tuple[int, int, float, float]:
+    h, w = shape
+    left, bottom, right, top = array_bounds(h, w, grid_transform)
+
+    projected = reproject_points(
+        cfg.geographic_crs,
+        grid_crs,
+        [cfg.ignition_lon],
+        [cfg.ignition_lat],
+    )
+    xs = projected[0]
+    ys = projected[1]
+    x_ign = float(xs[0])
+    y_ign = float(ys[0])
+
+    inside = left <= x_ign <= right and bottom <= y_ign <= top
+    if not inside:
+        geo_left, geo_bottom, geo_right, geo_top = transform_bounds(
+            grid_crs,
+            cfg.geographic_crs,
+            left,
+            bottom,
+            right,
+            top,
+            densify_pts=21,
+        )
+
+        swapped_projected = reproject_points(
+            cfg.geographic_crs,
+            grid_crs,
+            [cfg.ignition_lat],
+            [cfg.ignition_lon],
+        )
+        x_swapped = float(swapped_projected[0][0])
+        y_swapped = float(swapped_projected[1][0])
+        swapped_inside = left <= x_swapped <= right and bottom <= y_swapped <= top
+
+        if swapped_inside:
+            raise ValueError(
+                "Ignition coordinate is outside the modeled raster extent after reprojection. "
+                "Coordinates appear swapped. "
+                f"Try ignition_lat={cfg.ignition_lon}, ignition_lon={cfg.ignition_lat}. "
+                "Grid geographic extent "
+                f"(x_min, y_min, x_max, y_max) in {cfg.geographic_crs}: "
+                f"({geo_left:.6f}, {geo_bottom:.6f}, {geo_right:.6f}, {geo_top:.6f})."
+            )
+
+        raise ValueError(
+            "Ignition coordinate is outside the modeled raster extent after reprojection. "
+            f"Configured ignition_lat={cfg.ignition_lat}, ignition_lon={cfg.ignition_lon}. "
+            "Grid geographic extent "
+            f"(x_min, y_min, x_max, y_max) in {cfg.geographic_crs}: "
+            f"({geo_left:.6f}, {geo_bottom:.6f}, {geo_right:.6f}, {geo_top:.6f})."
+        )
+
+    row, col = rowcol(grid_transform, x_ign, y_ign)
+    iy = int(row)
+    ix = int(col)
+
+    if iy < 0 or iy >= h or ix < 0 or ix >= w:
+        raise ValueError(
+            "Ignition coordinate mapped to an invalid grid index after reprojection"
+        )
+
+    if bool(unburnable_mask[iy, ix]):
+        raise ValueError(
+            "Ignition coordinate falls on an unburnable cell (NDVI <= 0)."
+        )
+
+    return iy, ix, x_ign, y_ign
+
+
+def _validate_training_data(X_train: np.ndarray, y_train: np.ndarray) -> None:
+    if X_train.ndim != 2 or X_train.shape[1] != 5:
+        raise ValueError("Training features must have shape (N, 5)")
+    if y_train.ndim != 1 or len(y_train) != len(X_train):
+        raise ValueError("Training labels must have shape (N,) matching features")
+    if len(y_train) < 10:
+        raise ValueError("Insufficient training data; at least 10 samples are required")
+
+    classes = set(np.unique(y_train).tolist())
+    if not classes.issubset({-1.0, 1.0}):
+        raise ValueError("Training labels must be binary: -1 and +1")
+    if len(classes) < 2:
+        raise ValueError("Training labels must contain both fire and non-fire classes")
+
 
 def build_simulation(cfg: SimConfig):
-    """
-    1. Generate / load terrain rasters
-    2. Sample / load training data
-    3. Train LSSVM  (or load from cache)
-    4. Compute Pc probability surface
-    5. Assemble initial CA grid
-    6. Return CA instance + metadata
-    """
-    h, w = cfg.grid_h, cfg.grid_w
     backend_dir = Path(__file__).parent
-    gee_data_dir = Path(cfg.gee_data_dir)
-    if not gee_data_dir.is_absolute():
-        gee_data_dir = (backend_dir / gee_data_dir).resolve()
-    gee_data_dir_str = str(gee_data_dir)
-    wind_generation_status = "not_requested"
-    if cfg.gee_data_dir and not (gee_data_dir / "wind_t0").is_dir():
-        grib_path = backend_dir.parent / "downloadeduwindvwind.grib"
-        slope_ref = gee_data_dir / "slope.tif"
-        if grib_path.is_file() and slope_ref.is_file():
-            try:
-                process_wind_data(
-                    grib_path=str(grib_path),
-                    ref_path=str(slope_ref),
-                    output_dir=gee_data_dir_str,
-                )
-                wind_generation_status = "generated"
-            except Exception as exc:
-                print(f"Warning: wind data processing failed: {exc}")
-                wind_generation_status = "generation_failed"
-        else:
-            wind_generation_status = "missing_grib_or_slope"
+    data_dir = _resolve_path(backend_dir, cfg.gee_data_dir)
+    if not data_dir.is_dir():
+        raise FileNotFoundError(f"Data directory not found: {data_dir}")
 
-    wind_data_dir = gee_data_dir_str if (gee_data_dir / "wind_t0").is_dir() else None
+    for fname in ("slope.tif", "aspect.tif", "elevation.tif", "ndvi.tif", "humidity.tif", "training_samples.csv"):
+        if not (data_dir / fname).is_file():
+            raise FileNotFoundError(f"Missing required input file: {data_dir / fname}")
 
-    cache_key = _model_cache_key(cfg)
+    wind_generation_status = "precomputed"
+    wind_t0 = data_dir / "wind_t0"
+    if not wind_t0.is_dir():
+        grib_path = _resolve_path(backend_dir, cfg.grib_path)
+        if not grib_path.is_file():
+            raise FileNotFoundError(
+                f"Missing wind input: neither {wind_t0} exists nor GRIB file found at {grib_path}"
+            )
+
+        slope_ref = data_dir / "slope.tif"
+        process_wind_data(
+            grib_path=str(grib_path),
+            ref_path=str(slope_ref),
+            output_dir=str(data_dir),
+        )
+        wind_generation_status = "generated_from_grib"
+
+    if not wind_t0.is_dir():
+        raise FileNotFoundError(f"Wind processing failed; expected directory not found: {wind_t0}")
+
+    terrain, X_train, y_train = load_gee_data(
+        data_dir=str(data_dir),
+        projected_crs=cfg.projected_crs,
+        target_shape=(cfg.grid_h, cfg.grid_w),
+    )
+    _validate_training_data(X_train, y_train)
+
+    features = terrain["features"]
+    unburnable = terrain["unburnable_mask"].astype(bool)
+    slope = terrain["slope"]
+    grid_transform = terrain["grid_transform"]
+    grid_crs = terrain["grid_crs"]
+
+    h, w = int(features.shape[1]), int(features.shape[2])
+    cache_key = _model_cache_key(cfg, data_dir)
     model_path = CACHE_DIR / f"lssvm_{cache_key}.npz"
-    pc_path    = CACHE_DIR / f"pc_{cache_key}.npy"
+    pc_path = CACHE_DIR / f"pc_{cache_key}.npy"
     metrics_path = CACHE_DIR / f"metrics_{cache_key}.json"
 
-    # ── Try in-memory cache first ──────────────────────────────
     if cache_key in _mem_cache:
-        model, Pc, base_meta, features_unburnable_mask, slope = (
-            _mem_cache[cache_key][0],
-            _mem_cache[cache_key][1],
-            _mem_cache[cache_key][2],
-            _mem_cache[cache_key][3],
-            _mem_cache[cache_key][4],
-        )
-        unburnable = features_unburnable_mask.astype(bool)
+        model, Pc, base_meta = _mem_cache[cache_key]
         cache_src = "memory"
-    # ── Try disk cache ─────────────────────────────────────────
     elif model_path.exists() and pc_path.exists():
         t0 = time.time()
         model = LSSVM.load(model_path)
-        Pc = np.load(str(pc_path)).astype(np.float32)
-
-        # We still need terrain for slope + unburnable mask
-        if cfg.gee_data_dir:
-            terrain, _, _ = load_gee_data(gee_data_dir_str, target_shape=(h, w))
-        else:
-            terrain = generate_terrain(h, w, seed=cfg.terrain_seed)
-        unburnable = terrain["unburnable_mask"]
-        slope      = terrain["slope"]
-        train_time = time.time() - t0
+        Pc = np.load(pc_path).astype(np.float32)
+        if Pc.shape != (h, w):
+            raise ValueError(
+                f"Cached probability grid has shape {Pc.shape}, expected {(h, w)}. "
+                "Delete .model_cache to rebuild."
+            )
 
         if metrics_path.exists():
-            try:
-                with open(metrics_path, "r", encoding="utf-8") as f:
-                    base_meta = json.load(f)
-            except Exception:
-                base_meta = {}
+            with metrics_path.open("r", encoding="utf-8") as fh:
+                base_meta = json.load(fh)
         else:
             base_meta = {}
 
-        if not base_meta:
-            # Fallback for old caches without metrics metadata.
-            if model.X_train is not None and model.y_train is not None:
-                y_pred = model.predict(model.X_train)
-                y_score = model.predict_proba(model.X_train)
-                m = _classification_metrics(model.y_train, y_pred, y_score)
-                n_fire = int((model.y_train == 1).sum())
-                n_nofire = int((model.y_train == -1).sum())
-            else:
-                m = _classification_metrics(np.array([], dtype=np.int8), np.array([], dtype=np.int8), None)
-                n_fire = n_nofire = 0
-
-            base_meta = {
-                "total_samples": len(model.y_train) if model.y_train is not None else 0,
-                "train_samples": len(model.y_train) if model.y_train is not None else 0,
-                "val_samples": 0,
-                "train_fire": n_fire,
-                "train_nofire": n_nofire,
-                "val_fire": 0,
-                "val_nofire": 0,
-                "train_time_s": None,
-                "train_accuracy": round(m["accuracy"], 4),
-                "fire_accuracy": round(m["recall"], 4),
-                "nofire_accuracy": round(m["specificity"], 4),
-                "train_precision": round(m["precision"], 4),
-                "train_recall": round(m["recall"], 4),
-                "train_specificity": round(m["specificity"], 4),
-                "train_f1": round(m["f1"], 4),
-                "train_balanced_accuracy": round(m["balanced_accuracy"], 4),
-                "train_roc_auc": None if m["roc_auc"] is None else round(m["roc_auc"], 4),
-                "val_accuracy": None,
-                "val_precision": None,
-                "val_recall": None,
-                "val_specificity": None,
-                "val_f1": None,
-                "val_balanced_accuracy": None,
-                "val_roc_auc": None,
-                "val_tp": None,
-                "val_tn": None,
-                "val_fp": None,
-                "val_fn": None,
-                "lssvm_b": round(float(model.b or 0), 4),
-                "Pc_min": float(np.min(Pc[~unburnable])),
-                "Pc_max": float(np.max(Pc[~unburnable])),
-                "Pc_mean": float(np.mean(Pc[~unburnable])),
-            }
-
-        base_meta["cache_load_time_s"] = round(train_time, 3)
-        # Store in memory for next time
-        _mem_cache[cache_key] = (model, Pc, base_meta, unburnable.astype(np.uint8), slope)
+        base_meta["cache_load_time_s"] = round(time.time() - t0, 3)
+        _mem_cache[cache_key] = (model, Pc, base_meta)
         cache_src = "disk"
-    # ── Train from scratch ─────────────────────────────────────
     else:
-        if cfg.gee_data_dir:
-            terrain, X_train, y_train = load_gee_data(
-                gee_data_dir_str, target_shape=(h, w)
-            )
-        else:
-            terrain = generate_terrain(h, w, seed=cfg.terrain_seed)
-            X_train, y_train = generate_training_data(
-                terrain["features"], terrain["unburnable_mask"],
-                n_fire=cfg.n_train_fire,
-                n_nofire=cfg.n_train_nofire,
-                seed=cfg.terrain_seed + 1,
-            )
-
-        features   = terrain["features"]
-        unburnable = terrain["unburnable_mask"]
-        slope      = terrain["slope"]
-
         X_fit, y_fit, X_val, y_val = _stratified_train_val_split(
             X_train,
             y_train,
@@ -359,9 +565,7 @@ def build_simulation(cfg: SimConfig):
         train_time = time.time() - t0
 
         Pc = model.compute_probability_surface(features)
-        Pc[unburnable] = 0.0
 
-        # --- Compute train/validation metrics ---
         y_fit_pred = model.predict(X_fit)
         y_fit_score = model.predict_proba(X_fit)
         m_train = _classification_metrics(y_fit, y_fit_pred, y_fit_score)
@@ -370,30 +574,17 @@ def build_simulation(cfg: SimConfig):
             y_val_pred = model.predict(X_val)
             y_val_score = model.predict_proba(X_val)
             m_val = _classification_metrics(y_val, y_val_pred, y_val_score)
-            val_samples = int(len(y_val))
-            val_fire = int((y_val == 1).sum())
-            val_nofire = int((y_val == -1).sum())
         else:
             m_val = None
-            val_samples = 0
-            val_fire = 0
-            val_nofire = 0
-
-        n_fire = int((y_fit == 1).sum())
-        n_nofire = int((y_fit == -1).sum())
-
-        # Persist to disk
-        model.save(model_path)
-        np.save(str(pc_path), Pc)
 
         base_meta = {
             "total_samples": int(len(y_train)),
             "train_samples": int(len(y_fit)),
-            "val_samples": val_samples,
-            "train_fire": n_fire,
-            "train_nofire": n_nofire,
-            "val_fire": val_fire,
-            "val_nofire": val_nofire,
+            "val_samples": 0 if y_val is None else int(len(y_val)),
+            "train_fire": int((y_fit == 1).sum()),
+            "train_nofire": int((y_fit == -1).sum()),
+            "val_fire": 0 if y_val is None else int((y_val == 1).sum()),
+            "val_nofire": 0 if y_val is None else int((y_val == -1).sum()),
             "train_time_s": round(train_time, 3),
             "train_accuracy": round(m_train["accuracy"], 4),
             "fire_accuracy": round(m_train["recall"], 4),
@@ -415,35 +606,61 @@ def build_simulation(cfg: SimConfig):
             "val_tn": None if m_val is None else int(m_val["tn"]),
             "val_fp": None if m_val is None else int(m_val["fp"]),
             "val_fn": None if m_val is None else int(m_val["fn"]),
-            "lssvm_b": round(float(model.b or 0), 4),
-            "Pc_min": float(np.min(Pc[~unburnable])),
-            "Pc_max": float(np.max(Pc[~unburnable])),
-            "Pc_mean": float(np.mean(Pc[~unburnable])),
+            "lssvm_b": round(float(model.b or 0.0), 4),
         }
-        with open(metrics_path, "w", encoding="utf-8") as f:
-            json.dump(base_meta, f)
-        _mem_cache[cache_key] = (model, Pc, base_meta, unburnable.astype(np.uint8), slope)
+
+        model.save(model_path)
+        np.save(pc_path, Pc)
+        with metrics_path.open("w", encoding="utf-8") as fh:
+            json.dump(base_meta, fh)
+
+        _mem_cache[cache_key] = (model, Pc, base_meta)
         cache_src = "trained"
 
-    # --- Build CA (always fresh — depends on wind, ignition, etc.) ──
-    shape = (h, w)
-    grid = np.full(shape, UNIGNITED, dtype=np.uint8)
-    grid[unburnable.astype(bool)] = UNBURNABLE
+    Pc = np.asarray(Pc, dtype=np.float32)
+    Pc[unburnable] = 0.0
 
-    iy = max(0, min(h - 1, int(cfg.ignition_row_frac * h)))
-    ix = max(0, min(w - 1, int(cfg.ignition_col_frac * w)))
+    valid = ~unburnable
+    if not np.any(valid):
+        raise ValueError("All cells are unburnable after preprocessing")
 
-    # Multi-cell ignition block: set a (2r+1)×(2r+1) patch to BURNING
-    r = cfg.ignition_radius
+    pc_meta = {
+        "Pc_min": float(np.min(Pc[valid])),
+        "Pc_max": float(np.max(Pc[valid])),
+        "Pc_mean": float(np.mean(Pc[valid])),
+    }
+
+    pc_export_meta = _export_probability_geotiffs(
+        cfg=cfg,
+        cache_key=cache_key,
+        pc=Pc,
+        grid_transform=grid_transform,
+        grid_crs=grid_crs,
+        backend_dir=backend_dir,
+    )
+
+    iy, ix, ign_x, ign_y = _resolve_ignition_cell(
+        cfg=cfg,
+        grid_transform=grid_transform,
+        grid_crs=grid_crs,
+        shape=(h, w),
+        unburnable_mask=unburnable,
+    )
+
+    grid = np.full((h, w), UNIGNITED, dtype=np.uint8)
+    grid[unburnable] = UNBURNABLE
+
+    r = int(cfg.ignition_radius)
     r0 = max(0, iy - r)
     r1 = min(h, iy + r + 1)
     c0 = max(0, ix - r)
     c1 = min(w, ix + r + 1)
-    patch = grid[r0:r1, c0:c1]
-    patch[patch == UNIGNITED] = BURNING  # only ignite burnable cells
 
-    # The Pc surface is the ignition probability
-    p_ignite_grid = Pc
+    patch = grid[r0:r1, c0:c1]
+    ignitable = patch == UNIGNITED
+    if not np.any(ignitable):
+        raise ValueError("Ignition area does not overlap any burnable cells")
+    patch[ignitable] = BURNING
 
     ca_cfg = CAConfig(
         alpha=cfg.ca_alpha,
@@ -453,85 +670,151 @@ def build_simulation(cfg: SimConfig):
         ignition_radius=cfg.ignition_radius,
     )
 
-    # Cellular Automaton
     ca = ForestFireCA(
         initial_grid=grid,
-        p_ignite=p_ignite_grid,
+        p_ignite=Pc,
         cfg=ca_cfg,
         slope_deg=slope,
-        wind_data_dir=wind_data_dir,
+        wind_data_dir=str(data_dir),
+        grid_transform=grid_transform,
+        grid_crs=grid_crs,
     )
-    
+
     meta = {
         **base_meta,
+        **pc_meta,
+        **pc_export_meta,
         "cache": cache_src,
-        "wind_mode": "dynamic_grib_kw" if wind_data_dir else "constant_fallback",
+        "wind_mode": "dynamic_grib_kw",
         "wind_generation_status": wind_generation_status,
+        "projected_crs": str(grid_crs),
+        "geographic_crs": cfg.geographic_crs,
+        "ignition_lat": cfg.ignition_lat,
+        "ignition_lon": cfg.ignition_lon,
+        "ignition_x_m": round(ign_x, 3),
+        "ignition_y_m": round(ign_y, 3),
+        "ignition_row": iy,
+        "ignition_col": ix,
+        "grid_h": h,
+        "grid_w": w,
+        "config_path": str(_get_config_path()),
     }
-    return ca, Pc, meta
 
+    export_ctx = {
+        "cache_key": cache_key,
+        "grid_transform": grid_transform,
+        "grid_crs": grid_crs,
+    }
 
-# ------------------------------------------------------------------
-# REST endpoints
-# ------------------------------------------------------------------
+    return ca, Pc, meta, export_ctx
+
 
 @app.get("/health")
 def health():
     return {"ok": True}
 
 
-@app.post("/api/config-check")
-def config_check(cfg: SimConfig):
-    """Validate config without running simulation — returns meta info."""
-    _, Pc, meta = build_simulation(cfg)
-    return {"ok": True, **meta}
+@app.get("/api/config")
+def get_config():
+    try:
+        cfg = load_runtime_config()
+        return {"ok": True, "config": cfg.model_dump(), "config_path": str(_get_config_path())}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-# ------------------------------------------------------------------
-# WebSocket — streaming simulation
-# ------------------------------------------------------------------
+@app.get("/api/config-check")
+def config_check():
+    try:
+        cfg = load_runtime_config()
+        _, _, meta, _ = build_simulation(cfg)
+        return {"ok": True, "config": cfg.model_dump(), **meta}
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
 
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
     await ws.accept()
 
-    # Wait for initial config message (or use defaults)
     try:
-        raw = await asyncio.wait_for(ws.receive_text(), timeout=2.0)
-        cfg = SimConfig(**json.loads(raw))
-    except (asyncio.TimeoutError, Exception):
-        cfg = SimConfig()
+        cfg = load_runtime_config()
+        ca, Pc, meta, export_ctx = build_simulation(cfg)
+    except Exception as exc:
+        await ws.send_text(json.dumps({"type": "error", "message": str(exc)}))
+        await ws.close(code=1011)
+        return
 
-    ca, Pc, meta = build_simulation(cfg)
-
-    # Send metadata as first message
     await ws.send_text(json.dumps({"type": "meta", **meta}))
-
-    # Send Pc surface so frontend can show the heatmap
-    await ws.send_text(json.dumps({
-        "type": "probability",
-        "height": int(Pc.shape[0]),
-        "width": int(Pc.shape[1]),
-        "data": Pc.flatten().tolist(),
-    }))
-
-    # Stream CA steps
-    step_idx = 0
-    try:
-        while True:
-            frame = ca.step()
-            payload = {
-                "type": "frame",
-                "step": step_idx,
-                "height": int(frame.shape[0]),
-                "width": int(frame.shape[1]),
-                "cells": frame.flatten().tolist(),
+    await ws.send_text(
+        json.dumps(
+            {
+                "type": "probability",
+                "height": int(Pc.shape[0]),
+                "width": int(Pc.shape[1]),
+                "data": Pc.flatten().tolist(),
             }
-            await ws.send_text(json.dumps(payload))
+        )
+    )
+
+    step_idx = 0
+    final_frame = ca.grid.copy()
+
+    try:
+        while step_idx < cfg.max_steps:
+            frame = ca.step()
+            final_frame = frame.copy()
+
+            await ws.send_text(
+                json.dumps(
+                    {
+                        "type": "frame",
+                        "step": step_idx,
+                        "height": int(frame.shape[0]),
+                        "width": int(frame.shape[1]),
+                        "cells": frame.flatten().tolist(),
+                    }
+                )
+            )
             step_idx += 1
-            await asyncio.sleep(0.08)  # ~12.5 FPS
+
+            if not np.any(frame == BURNING):
+                break
+
+            await asyncio.sleep(0.08)
     except Exception:
         return
+
+    try:
+        ca_exports = _export_final_ca_geotiffs(
+            cfg=cfg,
+            cache_key=export_ctx["cache_key"],
+            step_idx=step_idx,
+            grid=final_frame,
+            grid_transform=export_ctx["grid_transform"],
+            grid_crs=export_ctx["grid_crs"],
+            backend_dir=Path(__file__).parent,
+        )
+        await ws.send_text(
+            json.dumps(
+                {
+                    "type": "completed",
+                    "steps": step_idx,
+                    **ca_exports,
+                }
+            )
+        )
+    except Exception as exc:
+        await ws.send_text(
+            json.dumps(
+                {
+                    "type": "warning",
+                    "message": f"Final CA GeoTIFF export failed: {exc}",
+                }
+            )
+        )
+
+
 if __name__ == "__main__":
     host = os.getenv("CA_HOST", "0.0.0.0")
     port = int(os.getenv("CA_PORT", "8000"))

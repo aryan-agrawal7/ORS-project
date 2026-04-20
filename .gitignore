@@ -3,3 +3,5 @@ __pycache__
 .model_cache
 wind_t*
 dist
+outputs/
+*.aux.xml

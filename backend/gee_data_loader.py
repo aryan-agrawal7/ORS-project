@@ -1,72 +1,26 @@
-"""
-Loader for GEE-exported training data.
-
-Reads the GeoTIFF rasters and CSV training samples exported by
-``gee_export.py`` and converts them into the exact format expected by
-the LSSVM → CA pipeline in ``main.py``.
-
-Expected directory layout (Google Drive → local download)
-─────────────────────────────────────────────────────────
-  <data_dir>/
-    slope.tif
-    aspect.tif
-    elevation.tif
-    ndvi.tif
-    humidity.tif
-    burned_mask.tif          (optional, for visualisation)
-    training_samples.csv     (slope, aspect, elevation, ndvi, humidity, label)
-
-Usage
------
-  from gee_data_loader import load_gee_data
-  terrain, X_train, y_train = load_gee_data("./lssvm_fire")
-  # terrain dict is a drop-in replacement for data_generator.generate_terrain()
-"""
+"""Utilities for loading and validating real GEE-exported wildfire inputs."""
 
 from __future__ import annotations
 
-import os
-import numpy as np
 import csv
-from typing import Tuple, Optional
+from pathlib import Path
+from typing import Optional, Tuple
+
+import numpy as np
+import rasterio
+from rasterio.crs import CRS
+from rasterio.enums import Resampling
+from rasterio.transform import array_bounds, from_bounds
+from rasterio.warp import calculate_default_transform, reproject
 
 
-# ---------------------------------------------------------------------------
-# Try to use rasterio (preferred), fall back to a GDAL-free TIFF reader
-# ---------------------------------------------------------------------------
-_HAS_RASTERIO = False
-try:
-    import rasterio                   # type: ignore
-    _HAS_RASTERIO = True
-except ImportError:
-    pass
-
-_HAS_TIFFFILE = False
-if not _HAS_RASTERIO:
-    try:
-        import tifffile               # type: ignore
-        _HAS_TIFFFILE = True
-    except ImportError:
-        pass
-
-
-def _read_tiff(path: str) -> np.ndarray:
-    """Read a single-band GeoTIFF and return it as a 2-D float32 array."""
-    if _HAS_RASTERIO:
-        with rasterio.open(path) as src:
-            arr = src.read(1).astype(np.float32)
-        return arr
-    if _HAS_TIFFFILE:
-        arr = tifffile.imread(path).astype(np.float32)
-        if arr.ndim == 3:             # (bands, H, W) or (H, W, bands)
-            arr = arr[0] if arr.shape[0] <= arr.shape[-1] else arr[..., 0]
-        return arr
-
-    raise ImportError(
-        "Neither 'rasterio' nor 'tifffile' is installed.\n"
-        "  pip install rasterio       # recommended\n"
-        "  pip install tifffile       # lightweight alternative"
-    )
+FEATURE_FILES = (
+    "slope.tif",
+    "aspect.tif",
+    "elevation.tif",
+    "ndvi.tif",
+    "humidity.tif",
+)
 
 
 def _normalise(arr: np.ndarray) -> np.ndarray:
@@ -77,118 +31,153 @@ def _normalise(arr: np.ndarray) -> np.ndarray:
     return ((arr - lo) / (hi - lo)).astype(np.float32)
 
 
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
+def _build_target_grid(
+    slope_path: Path,
+    dst_crs: CRS,
+    target_shape: Optional[Tuple[int, int]],
+) -> tuple[object, int, int]:
+    """Create the projected modeling grid transform/shape."""
+    with rasterio.open(slope_path) as src:
+        if src.crs is None:
+            raise ValueError(f"Missing CRS metadata in {slope_path}")
 
-def load_gee_rasters(data_dir: str, target_shape: Optional[Tuple[int, int]] = None):
-    """
-    Load the five feature rasters exported by ``gee_export.py``.
+        base_transform, base_w, base_h = calculate_default_transform(
+            src.crs,
+            dst_crs,
+            src.width,
+            src.height,
+            *src.bounds,
+        )
 
-    Parameters
-    ----------
-    data_dir : str
-        Path to the folder containing the GeoTIFFs.
-    target_shape : (H, W) or None
-        If given, resample all rasters to this shape (nearest neighbour).
-        Useful to match the CA grid size when the raw rasters are larger.
+    if target_shape is None:
+        return base_transform, int(base_h), int(base_w)
 
-    Returns
-    -------
-    dict  — same schema as ``data_generator.generate_terrain()``:
-        'slope', 'aspect', 'elevation', 'ndvi', 'humidity' : (H, W) raw
-        'features'        : (5, H, W) normalised [0, 1]
-        'unburnable_mask' : (H, W) bool — True where NDVI ≤ 0 (water / barren)
-    """
-    required = ["slope.tif", "aspect.tif", "elevation.tif", "ndvi.tif", "humidity.tif"]
-    for fname in required:
-        fpath = os.path.join(data_dir, fname)
-        if not os.path.isfile(fpath):
+    dst_h, dst_w = int(target_shape[0]), int(target_shape[1])
+    if dst_h <= 0 or dst_w <= 0:
+        raise ValueError("target_shape must contain positive values")
+
+    left, bottom, right, top = array_bounds(base_h, base_w, base_transform)
+    transform = from_bounds(left, bottom, right, top, dst_w, dst_h)
+    return transform, dst_h, dst_w
+
+
+def _reproject_single_band(
+    path: Path,
+    dst_transform,
+    dst_crs: CRS,
+    dst_h: int,
+    dst_w: int,
+    resampling: Resampling,
+) -> np.ndarray:
+    with rasterio.open(path) as src:
+        if src.crs is None:
+            raise ValueError(f"Missing CRS metadata in {path}")
+
+        dst = np.empty((dst_h, dst_w), dtype=np.float32)
+        reproject(
+            source=rasterio.band(src, 1),
+            destination=dst,
+            src_transform=src.transform,
+            src_crs=src.crs,
+            dst_transform=dst_transform,
+            dst_crs=dst_crs,
+            resampling=resampling,
+        )
+    return np.nan_to_num(dst, nan=0.0)
+
+
+def load_gee_rasters(
+    data_dir: str,
+    projected_crs: str,
+    target_shape: Optional[Tuple[int, int]] = None,
+) -> dict:
+    """Load required rasters and reproject to a meter-based modeling CRS."""
+    data_path = Path(data_dir)
+    if not data_path.is_dir():
+        raise FileNotFoundError(f"Data directory not found: {data_path}")
+
+    dst_crs = CRS.from_user_input(projected_crs)
+
+    for fname in FEATURE_FILES:
+        fpath = data_path / fname
+        if not fpath.is_file():
             raise FileNotFoundError(f"Missing required raster: {fpath}")
 
-    raw = {}
-    for fname in required:
-        name = fname.replace(".tif", "")
-        arr  = _read_tiff(os.path.join(data_dir, fname))
-        # Replace NaN / nodata with sensible defaults
-        arr = np.nan_to_num(arr, nan=0.0)
-        raw[name] = arr
+    dst_transform, dst_h, dst_w = _build_target_grid(
+        data_path / "slope.tif",
+        dst_crs,
+        target_shape,
+    )
 
-    # Optional: resample to a common target shape
-    if target_shape is not None:
-        from scipy.ndimage import zoom          # type: ignore
-        for name, arr in raw.items():
-            if arr.shape != target_shape:
-                factors = (target_shape[0] / arr.shape[0],
-                           target_shape[1] / arr.shape[1])
-                raw[name] = zoom(arr, factors, order=1).astype(np.float32)
+    raw: dict[str, np.ndarray] = {}
+    for fname in FEATURE_FILES:
+        key = fname[:-4]
+        raw[key] = _reproject_single_band(
+            data_path / fname,
+            dst_transform=dst_transform,
+            dst_crs=dst_crs,
+            dst_h=dst_h,
+            dst_w=dst_w,
+            resampling=Resampling.bilinear,
+        )
 
-    # Ensure all rasters are the same shape (use the first one as reference)
-    ref_shape = raw["slope"].shape
-    for name, arr in raw.items():
-        if arr.shape != ref_shape:
-            raise ValueError(
-                f"Raster shape mismatch: {name} is {arr.shape}, "
-                f"expected {ref_shape} (same as slope.tif). "
-                f"Use target_shape= to resample."
-            )
+    burned_mask = None
+    burned_path = data_path / "burned_mask.tif"
+    if burned_path.is_file():
+        burned_mask = _reproject_single_band(
+            burned_path,
+            dst_transform=dst_transform,
+            dst_crs=dst_crs,
+            dst_h=dst_h,
+            dst_w=dst_w,
+            resampling=Resampling.nearest,
+        ) > 0
 
-    # Build normalised feature stack:  [slope, aspect, elevation, ndvi, humidity]
-    features = np.stack([
-        _normalise(raw["slope"]),
-        _normalise(raw["aspect"]),
-        _normalise(raw["elevation"]),
-        _normalise(raw["ndvi"]),
-        _normalise(raw["humidity"]),
-    ], axis=0)   # (5, H, W)
+    features = np.stack(
+        [
+            _normalise(raw["slope"]),
+            _normalise(raw["aspect"]),
+            _normalise(raw["elevation"]),
+            _normalise(raw["ndvi"]),
+            _normalise(raw["humidity"]),
+        ],
+        axis=0,
+    )
 
-    # Unburnable mask: water / barren where NDVI ≤ 0
     unburnable = raw["ndvi"] <= 0.0
 
-    # If burned_mask.tif exists, load it too
-    burned_path = os.path.join(data_dir, "burned_mask.tif")
-    burned_mask = None
-    if os.path.isfile(burned_path):
-        burned_mask = _read_tiff(burned_path).astype(bool)
-        if target_shape and burned_mask.shape != ref_shape:
-            from scipy.ndimage import zoom
-            burned_mask = zoom(burned_mask.astype(np.float32),
-                               (ref_shape[0] / burned_mask.shape[0],
-                                ref_shape[1] / burned_mask.shape[1]),
-                               order=0).astype(bool)
-
     return {
-        "elevation":      raw["elevation"],
-        "slope":          raw["slope"],
-        "aspect":         raw["aspect"],
-        "ndvi":           raw["ndvi"],
-        "humidity":       raw["humidity"],
-        "features":       features,
+        "elevation": raw["elevation"],
+        "slope": raw["slope"],
+        "aspect": raw["aspect"],
+        "ndvi": raw["ndvi"],
+        "humidity": raw["humidity"],
+        "features": features,
         "unburnable_mask": unburnable,
-        "burned_mask":    burned_mask,
+        "burned_mask": burned_mask,
+        "grid_transform": dst_transform,
+        "grid_crs": dst_crs,
+        "grid_shape": (dst_h, dst_w),
+        "grid_bounds": array_bounds(dst_h, dst_w, dst_transform),
     }
 
 
 def load_gee_training_csv(csv_path: str) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Load the training CSV exported by ``gee_export.py``.
+    """Load and validate training samples from CSV."""
+    path = Path(csv_path)
+    if not path.is_file():
+        raise FileNotFoundError(f"Training CSV not found: {path}")
 
-    Parameters
-    ----------
-    csv_path : str
-        Path to ``training_samples.csv``.
-
-    Returns
-    -------
-    X : (N, 5) float64 — columns: [slope, aspect, elevation, ndvi, humidity]
-    y : (N,)   float64 — labels: +1 (fire) / -1 (non-fire)
-    """
-    if not os.path.isfile(csv_path):
-        raise FileNotFoundError(f"Training CSV not found: {csv_path}")
-
+    required_cols = {"slope", "aspect", "elevation", "ndvi", "humidity", "label"}
     rows = []
-    with open(csv_path, "r", newline="") as f:
-        reader = csv.DictReader(f)
+
+    with path.open("r", newline="", encoding="utf-8") as fh:
+        reader = csv.DictReader(fh)
+        if reader.fieldnames is None or not required_cols.issubset(set(reader.fieldnames)):
+            raise ValueError(
+                "training_samples.csv must contain columns: slope, aspect, elevation, ndvi, humidity, label"
+            )
+
         for row in reader:
             try:
                 vals = [
@@ -200,23 +189,32 @@ def load_gee_training_csv(csv_path: str) -> Tuple[np.ndarray, np.ndarray]:
                 ]
                 label = float(row["label"])
                 rows.append(vals + [label])
-            except (KeyError, ValueError):
-                continue   # skip malformed rows
+            except (TypeError, ValueError):
+                continue
 
     if not rows:
-        raise ValueError("No valid rows found in training CSV")
+        raise ValueError("No valid rows found in training_samples.csv")
 
-    data = np.array(rows, dtype=np.float64)
+    data = np.asarray(rows, dtype=np.float64)
     X = data[:, :5]
-    y = data[:, 5]
+    y_raw = data[:, 5]
 
-    # Normalise features to [0, 1] per column (matching raster normalisation)
+    unique = set(np.unique(y_raw).tolist())
+    if unique.issubset({0.0, 1.0}):
+        y = np.where(y_raw >= 0.5, 1.0, -1.0)
+    elif unique.issubset({-1.0, 1.0}):
+        y = y_raw
+    else:
+        raise ValueError(
+            "training labels must be either {-1, +1} or {0, 1}; found: "
+            + ", ".join(str(v) for v in sorted(unique))
+        )
+
     for col in range(5):
         lo, hi = X[:, col].min(), X[:, col].max()
         if hi - lo > 1e-8:
             X[:, col] = (X[:, col] - lo) / (hi - lo)
 
-    # Shuffle
     rng = np.random.default_rng(42)
     perm = rng.permutation(len(y))
     return X[perm], y[perm]
@@ -224,25 +222,14 @@ def load_gee_training_csv(csv_path: str) -> Tuple[np.ndarray, np.ndarray]:
 
 def load_gee_data(
     data_dir: str,
+    projected_crs: str,
     target_shape: Optional[Tuple[int, int]] = None,
 ) -> Tuple[dict, np.ndarray, np.ndarray]:
-    """
-    Convenience wrapper — loads both rasters and training CSV.
-
-    Parameters
-    ----------
-    data_dir : str
-        Folder with the GEE exports.
-    target_shape : (H, W) or None
-        Resample rasters to this size.
-
-    Returns
-    -------
-    terrain : dict       — same as generate_terrain()
-    X_train : (N, 5)
-    y_train : (N,)
-    """
-    terrain = load_gee_rasters(data_dir, target_shape=target_shape)
-    csv_path = os.path.join(data_dir, "training_samples.csv")
-    X_train, y_train = load_gee_training_csv(csv_path)
+    """Load validated real-world rasters and training data for modeling."""
+    terrain = load_gee_rasters(
+        data_dir=data_dir,
+        projected_crs=projected_crs,
+        target_shape=target_shape,
+    )
+    X_train, y_train = load_gee_training_csv(str(Path(data_dir) / "training_samples.csv"))
     return terrain, X_train, y_train

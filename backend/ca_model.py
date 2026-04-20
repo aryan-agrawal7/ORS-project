@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 import rasterio
 from rasterio.enums import Resampling
+from rasterio.warp import reproject
 
 # States (as in the paper, Section 2.1)
 UNBURNABLE = 0  # cannot be burned  (e.g. water, rock)
@@ -184,7 +185,9 @@ class ForestFireCA:
     def __init__(self, initial_grid: np.ndarray, p_ignite: np.ndarray,
                  cfg: Optional[CAConfig] = None,
                  slope_deg: Optional[np.ndarray] = None,
-                 wind_data_dir: Optional[str] = None):
+                 wind_data_dir: Optional[str] = None,
+                 grid_transform=None,
+                 grid_crs=None):
         if initial_grid.shape != p_ignite.shape:
             raise ValueError("initial_grid and p_ignite must have same shape")
         self.grid = initial_grid.astype(np.uint8)
@@ -192,6 +195,8 @@ class ForestFireCA:
         self.cfg = cfg or CAConfig()
         self.rng = np.random.default_rng(self.cfg.seed)
         self.wind_data_dir = wind_data_dir
+        self.grid_transform = grid_transform
+        self.grid_crs = grid_crs
         self.step_index = 0
         self.dynamic_wind_enabled = False
         self.wind_weights = compute_wind_weights(self.cfg.wind)
@@ -241,14 +246,28 @@ class ForestFireCA:
             if not os.path.isfile(fp):
                 return False
             with rasterio.open(fp) as src:
-                if (src.height, src.width) == self.grid.shape:
-                    arr = src.read(1).astype(np.float32)
-                else:
-                    arr = src.read(
-                        1,
-                        out_shape=self.grid.shape,
+                if self.grid_transform is not None and self.grid_crs is not None:
+                    if src.crs is None:
+                        return False
+                    arr = np.empty(self.grid.shape, dtype=np.float32)
+                    reproject(
+                        source=rasterio.band(src, 1),
+                        destination=arr,
+                        src_transform=src.transform,
+                        src_crs=src.crs,
+                        dst_transform=self.grid_transform,
+                        dst_crs=self.grid_crs,
                         resampling=Resampling.bilinear,
-                    ).astype(np.float32)
+                    )
+                else:
+                    if (src.height, src.width) == self.grid.shape:
+                        arr = src.read(1).astype(np.float32)
+                    else:
+                        arr = src.read(
+                            1,
+                            out_shape=self.grid.shape,
+                            resampling=Resampling.bilinear,
+                        ).astype(np.float32)
             weights.append(arr)
 
         self.wind_weights = np.stack(weights, axis=0)
