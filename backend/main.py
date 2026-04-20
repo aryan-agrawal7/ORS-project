@@ -25,6 +25,12 @@ from rasterio.warp import (
 )
 
 from ca_model import BURNING, CAConfig, ForestFireCA, UNBURNABLE, UNIGNITED
+from ca_model_not_ml import (
+    ContinuousFireCA,
+    EARLY as CA_ONLY_EARLY,
+    FULL as CA_ONLY_FULL,
+    UNBURNT as CA_ONLY_UNBURNT,
+)
 from gee_data_loader import load_gee_data
 from lssvm_model import LSSVM
 from wind_data_processor import process_wind_data
@@ -71,11 +77,23 @@ class SimConfig(BaseModel):
 
     max_steps: int = Field(default=400, ge=1, le=5000)
 
+    # CA-not-ML tuning values kept in runtime config for parity with the
+    # separate CA-only workflow.
+    ca_only_kr: float = Field(default=1 / 25, gt=0.0)
+    ca_only_ks: float = Field(default=1.0, ge=0.0)
+
     output_dir: str = "../outputs"
     output_prefix: str = "wildfire"
 
 
 _mem_cache: dict[str, tuple[LSSVM, np.ndarray, dict]] = {}
+
+CA_ONLY_DEFAULT_TEMPERATURE = 30.0
+CA_ONLY_DEFAULT_WIND_SPEED = 3.0
+CA_ONLY_DEFAULT_WIND_DIRECTION_DEG = 90.0
+CA_ONLY_DEFAULT_L = 30.0
+CA_ONLY_DEFAULT_DT0 = 1.0
+CA_ONLY_DEFAULT_SLOPE_FACTOR = 1.0
 
 
 def _resolve_path(base_dir: Path, maybe_relative: str) -> Path:
@@ -83,6 +101,126 @@ def _resolve_path(base_dir: Path, maybe_relative: str) -> Path:
     if not path.is_absolute():
         path = (base_dir / path).resolve()
     return path
+
+
+def _load_ca_only_wind_from_data(
+    data_dir: Path,
+    target_shape: tuple[int, int],
+) -> tuple[Optional[np.ndarray], Optional[np.ndarray], str]:
+    """Load CA-only wind speed and direction from data/wind_t0 if available."""
+    wind_dir = data_dir / "wind_t0"
+    speed_path = wind_dir / "wind_speed_resampled.tif"
+    dir_path = wind_dir / "wind_direction_to_resampled.tif"
+
+    if not speed_path.is_file() or not dir_path.is_file():
+        return None, None, "fallback_constant"
+
+    try:
+        with rasterio.open(speed_path) as src:
+            if (src.height, src.width) == target_shape:
+                speed = src.read(1).astype(np.float32)
+            else:
+                speed = src.read(
+                    1,
+                    out_shape=target_shape,
+                    resampling=Resampling.bilinear,
+                ).astype(np.float32)
+
+        with rasterio.open(dir_path) as src:
+            if (src.height, src.width) == target_shape:
+                direction = src.read(1).astype(np.float32)
+            else:
+                direction = src.read(
+                    1,
+                    out_shape=target_shape,
+                    resampling=Resampling.bilinear,
+                ).astype(np.float32)
+
+        speed = np.nan_to_num(speed, nan=0.0)
+        direction = np.nan_to_num(direction, nan=CA_ONLY_DEFAULT_WIND_DIRECTION_DEG)
+        direction = np.mod(direction, 360.0).astype(np.float32)
+        return speed.astype(np.float32), direction, "data_wind_t0"
+    except Exception:
+        return None, None, "fallback_constant"
+
+
+def _build_ca_only_simulation(
+    cfg: SimConfig,
+    terrain: dict,
+    ignition_row: int,
+    ignition_col: int,
+    data_dir: Path,
+) -> tuple[ContinuousFireCA, dict]:
+    """Build the non-ML CA model on the same domain and ignition as LSSVM+CA."""
+    unburnable = terrain["unburnable_mask"].astype(bool)
+    burnable = ~unburnable
+    h, w = unburnable.shape
+    shape = (h, w)
+
+    grid = np.full(shape, CA_ONLY_UNBURNT, dtype=np.uint8)
+    r = int(cfg.ignition_radius)
+    r0 = max(0, ignition_row - r)
+    r1 = min(h, ignition_row + r + 1)
+    c0 = max(0, ignition_col - r)
+    c1 = min(w, ignition_col + r + 1)
+
+    patch = grid[r0:r1, c0:c1]
+    patch_burnable = burnable[r0:r1, c0:c1]
+    patch[patch_burnable] = CA_ONLY_EARLY
+    if burnable[ignition_row, ignition_col]:
+        grid[ignition_row, ignition_col] = CA_ONLY_FULL
+
+    humidity = np.clip(
+        np.nan_to_num(terrain["humidity"], nan=50.0).astype(np.float32),
+        1.0,
+        100.0,
+    )
+    slope_deg = np.nan_to_num(terrain["slope"], nan=0.0).astype(np.float32)
+    slope_rad = np.radians(np.clip(slope_deg, 0.0, 35.0))
+    aspect_deg = np.nan_to_num(terrain["aspect"], nan=0.0).astype(np.float32)
+
+    wind_speed, wind_direction_deg, wind_source = _load_ca_only_wind_from_data(data_dir, shape)
+    if wind_speed is None or wind_direction_deg is None:
+        wind_speed = np.full(shape, CA_ONLY_DEFAULT_WIND_SPEED, dtype=np.float32)
+        wind_direction_deg = np.full(shape, CA_ONLY_DEFAULT_WIND_DIRECTION_DEG, dtype=np.float32)
+
+    wind_rad = np.radians(wind_direction_deg)
+    phi = np.radians(aspect_deg) - wind_rad
+
+    Ks = np.full(shape, cfg.ca_only_ks, dtype=np.float32)
+    Ks[~burnable] = 0.0
+
+    ca_only = ContinuousFireCA(
+        grid=grid,
+        T=np.full(shape, CA_ONLY_DEFAULT_TEMPERATURE, dtype=np.float32),
+        v=wind_speed,
+        RH=humidity,
+        phi=phi,
+        slope=slope_rad,
+        g=np.full(shape, CA_ONLY_DEFAULT_SLOPE_FACTOR, dtype=np.float32),
+        Ks=Ks,
+        burnable_mask=burnable,
+        Kr=cfg.ca_only_kr,
+        L=CA_ONLY_DEFAULT_L,
+        dt0=CA_ONLY_DEFAULT_DT0,
+    )
+
+    burnable_count = int(np.count_nonzero(burnable))
+    speed_mean = float(np.mean(wind_speed[burnable])) if burnable_count else float(np.mean(wind_speed))
+    direction_mean = (
+        float(np.mean(wind_direction_deg[burnable]))
+        if burnable_count
+        else float(np.mean(wind_direction_deg))
+    )
+
+    meta = {
+        "ca_only_kr": cfg.ca_only_kr,
+        "ca_only_ks": cfg.ca_only_ks,
+        "ca_only_wind_source": wind_source,
+        "ca_only_wind_speed_mean": speed_mean,
+        "ca_only_wind_direction_mean": direction_mean,
+    }
+    return ca_only, meta
 
 
 def _get_config_path() -> Path:
@@ -704,6 +842,10 @@ def build_simulation(cfg: SimConfig):
         "cache_key": cache_key,
         "grid_transform": grid_transform,
         "grid_crs": grid_crs,
+        "terrain": terrain,
+        "ignition_row": iy,
+        "ignition_col": ix,
+        "data_dir": str(data_dir),
     }
 
     return ca, Pc, meta, export_ctx
@@ -740,12 +882,19 @@ async def ws_endpoint(ws: WebSocket):
     try:
         cfg = load_runtime_config()
         ca, Pc, meta, export_ctx = build_simulation(cfg)
+        ca_only, ca_only_meta = _build_ca_only_simulation(
+            cfg=cfg,
+            terrain=export_ctx["terrain"],
+            ignition_row=int(export_ctx["ignition_row"]),
+            ignition_col=int(export_ctx["ignition_col"]),
+            data_dir=Path(export_ctx["data_dir"]),
+        )
     except Exception as exc:
         await ws.send_text(json.dumps({"type": "error", "message": str(exc)}))
         await ws.close(code=1011)
         return
 
-    await ws.send_text(json.dumps({"type": "meta", **meta}))
+    await ws.send_text(json.dumps({"type": "meta", **meta, **ca_only_meta}))
     await ws.send_text(
         json.dumps(
             {
@@ -759,11 +908,37 @@ async def ws_endpoint(ws: WebSocket):
 
     step_idx = 0
     final_frame = ca.grid.copy()
+    final_ca_only_frame = ca_only.to_frontend_grid().copy()
+    lssvm_active = True
 
     try:
-        while step_idx < cfg.max_steps:
-            frame = ca.step()
-            final_frame = frame.copy()
+        await ws.send_text(
+            json.dumps(
+                {
+                    "type": "frame",
+                    "step": step_idx,
+                    "height": int(final_frame.shape[0]),
+                    "width": int(final_frame.shape[1]),
+                    "cells": final_frame.flatten().tolist(),
+                    "ca_only_cells": final_ca_only_frame.flatten().tolist(),
+                }
+            )
+        )
+        step_idx += 1
+
+        while True:
+            if lssvm_active:
+                frame = ca.step()
+                final_frame = frame.copy()
+                if not np.any(frame == BURNING):
+                    lssvm_active = False
+            else:
+                frame = final_frame
+
+            ca_only.step()
+            final_ca_only_frame = ca_only.to_frontend_grid().copy()
+
+            ca_only_frame = final_ca_only_frame
 
             await ws.send_text(
                 json.dumps(
@@ -773,46 +948,15 @@ async def ws_endpoint(ws: WebSocket):
                         "height": int(frame.shape[0]),
                         "width": int(frame.shape[1]),
                         "cells": frame.flatten().tolist(),
+                        "ca_only_cells": ca_only_frame.flatten().tolist(),
                     }
                 )
             )
             step_idx += 1
 
-            if not np.any(frame == BURNING):
-                break
-
             await asyncio.sleep(0.08)
     except Exception:
         return
-
-    try:
-        ca_exports = _export_final_ca_geotiffs(
-            cfg=cfg,
-            cache_key=export_ctx["cache_key"],
-            step_idx=step_idx,
-            grid=final_frame,
-            grid_transform=export_ctx["grid_transform"],
-            grid_crs=export_ctx["grid_crs"],
-            backend_dir=Path(__file__).parent,
-        )
-        await ws.send_text(
-            json.dumps(
-                {
-                    "type": "completed",
-                    "steps": step_idx,
-                    **ca_exports,
-                }
-            )
-        )
-    except Exception as exc:
-        await ws.send_text(
-            json.dumps(
-                {
-                    "type": "warning",
-                    "message": f"Final CA GeoTIFF export failed: {exc}",
-                }
-            )
-        )
 
 
 if __name__ == "__main__":

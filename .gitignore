@@ -4,4 +4,5 @@ __pycache__
 wind_t*
 dist
 outputs/
-*.aux.xml
+*.aux.xml.codex
+.venv

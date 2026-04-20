@@ -4,7 +4,8 @@ import { drawCA, drawProbabilityHeatmap } from "./caRenderer";
 const WS_URL = "ws://localhost:8000/ws";
 
 export default function App() {
-  const caCanvasRef = useRef(null);
+  const lssvmCanvasRef = useRef(null);
+  const caOnlyCanvasRef = useRef(null);
   const probCanvasRef = useRef(null);
   const wsRef = useRef(null);
   const cellSizeRef = useRef(5);
@@ -33,7 +34,6 @@ export default function App() {
 
     const ws = new WebSocket(WS_URL);
     wsRef.current = ws;
-
     ws.onopen = () => {
       setStatus("connected");
     };
@@ -78,17 +78,26 @@ export default function App() {
       }
 
       if (msg.type === "frame") {
-        const { step: s, height, width, cells } = msg;
+        const { step: s, height, width, cells, ca_only_cells: caOnlyCells } = msg;
         setStep(s);
         setGridSize({ h: height, w: width });
 
-        const canvas = caCanvasRef.current;
-        if (canvas) {
+        const lssvmCanvas = lssvmCanvasRef.current;
+        if (lssvmCanvas) {
           const drawSize = cellSizeRef.current;
-          canvas.width = width * drawSize;
-          canvas.height = height * drawSize;
-          const ctx = canvas.getContext("2d");
+          lssvmCanvas.width = width * drawSize;
+          lssvmCanvas.height = height * drawSize;
+          const ctx = lssvmCanvas.getContext("2d");
           drawCA(ctx, cells, height, width, drawSize);
+        }
+
+        const caOnlyCanvas = caOnlyCanvasRef.current;
+        if (caOnlyCanvas && Array.isArray(caOnlyCells)) {
+          const drawSize = cellSizeRef.current;
+          caOnlyCanvas.width = width * drawSize;
+          caOnlyCanvas.height = height * drawSize;
+          const ctx = caOnlyCanvas.getContext("2d");
+          drawCA(ctx, caOnlyCells, height, width, drawSize);
         }
         return;
       }
@@ -115,7 +124,7 @@ export default function App() {
 
   return (
     <div style={{ fontFamily: "system-ui", padding: 16, maxWidth: 1300 }}>
-      <h2 style={{ marginTop: 0 }}>LSSVM-CA Forest Fire Spread Simulation</h2>
+      <h2 style={{ marginTop: 0 }}>LSSVM+CA vs CA-only Fire Spread Comparison</h2>
 
       <div style={{ display: "flex", gap: 16, alignItems: "center", flexWrap: "wrap", marginBottom: 12 }}>
         <span><b>Status:</b> {status}</span>
@@ -136,6 +145,18 @@ export default function App() {
               </span>
             )}
             <span><b>Pc range:</b> [{meta.Pc_min?.toFixed(3)}, {meta.Pc_max?.toFixed(3)}]</span>
+            <span><b>LSSVM b:</b> {meta.lssvm_b}</span>
+            <span title="Model source: trained = fresh, memory = in-memory cache, disk = loaded from .npz">
+              <b>Model:</b> {meta.cache === "trained" ? "trained" : meta.cache === "disk" ? "disk cache" : "memory cache"}
+            </span>
+            <span>
+              <b>LSSVM Wind:</b> {meta.wind_mode === "dynamic_grib_kw" ? "gridded hourly" : "constant fallback"}
+            </span>
+            <span>
+              <b>CA-only wind:</b> {meta.ca_only_wind_speed_mean?.toFixed(2)} m/s @ {meta.ca_only_wind_direction_mean?.toFixed(1)}°
+            </span>
+            <span><b>CA-only Kr:</b> {meta.ca_only_kr?.toFixed(4)}</span>
+            <span><b>CA-only Ks:</b> {meta.ca_only_ks?.toFixed(2)}</span>
             <span><b>Model:</b> {meta.cache}</span>
             <span><b>Projected CRS:</b> {meta.projected_crs}</span>
             <span><b>Geographic CRS:</b> {meta.geographic_crs}</span>
@@ -174,9 +195,16 @@ export default function App() {
 
       <div style={{ display: "flex", gap: 16, flexWrap: "wrap" }}>
         <div>
-          <h4 style={{ margin: "0 0 4px 0" }}>CA Fire Spread</h4>
+          <h4 style={{ margin: "0 0 4px 0" }}>LSSVM+CA Fire Spread</h4>
           <div style={canvasContainerStyle}>
-            <canvas ref={caCanvasRef} />
+            <canvas ref={lssvmCanvasRef} />
+          </div>
+        </div>
+
+        <div>
+          <h4 style={{ margin: "0 0 4px 0" }}>CA-only Fire Spread</h4>
+          <div style={canvasContainerStyle}>
+            <canvas ref={caOnlyCanvasRef} />
           </div>
         </div>
 

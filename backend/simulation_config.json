@@ -15,6 +15,8 @@
   "ca_seed": 42,
   "burn_duration": 4,
   "max_steps": 400,
+  "ca_only_kr": 0.04,
+  "ca_only_ks": 1.0,
   "output_dir": "../outputs",
   "output_prefix": "wildfire"
 }

@@ -10,7 +10,6 @@ export function drawCA(ctx, cells, h, w, cellSize) {
   const imageData = ctx.createImageData(imgW, imgH);
   const data = imageData.data;
 
-  // Simple palette (you can customize)
   // unburnable: dark gray, unignited: green, burning: red/orange, burned: black
   const palette = {
     [UNBURNABLE]: [80, 80, 80, 255],
