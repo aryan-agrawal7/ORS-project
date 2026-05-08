@@ -25,7 +25,7 @@ from rasterio.warp import (
 )
 
 from ca_model import BURNING, CAConfig, ForestFireCA, UNBURNABLE, UNIGNITED
-from gee_data_loader import load_gee_data
+from gee_data_loader import load_gee_rasters
 from lssvm_model import LSSVM
 from wind_data_processor import process_wind_data
 
@@ -41,8 +41,6 @@ app.add_middleware(
 
 
 CONFIG_PATH = Path(__file__).parent / "simulation_config.json"
-CACHE_DIR = Path(__file__).parent / ".model_cache"
-CACHE_DIR.mkdir(exist_ok=True)
 
 
 class SimConfig(BaseModel):
@@ -63,6 +61,7 @@ class SimConfig(BaseModel):
 
     lssvm_gamma: float = Field(default=100.0, gt=0.0)
     lssvm_sigma: float = Field(default=1.0, gt=0.0)
+    lssvm_model_path: str = ".model_cache/lssvm_model.npz"
 
     ca_alpha: float = Field(default=2.0, gt=0.0)
     ca_beta: float = Field(default=1.0, gt=0.0)
@@ -73,9 +72,6 @@ class SimConfig(BaseModel):
 
     output_dir: str = "../outputs"
     output_prefix: str = "wildfire"
-
-
-_mem_cache: dict[str, tuple[LSSVM, np.ndarray, dict]] = {}
 
 
 def _resolve_path(base_dir: Path, maybe_relative: str) -> Path:
@@ -114,19 +110,17 @@ def load_runtime_config() -> SimConfig:
     return cfg
 
 
-def _model_cache_key(cfg: SimConfig, data_dir: Path) -> str:
-    training_csv = data_dir / "training_samples.csv"
+def _model_cache_key(cfg: SimConfig, data_dir: Path, model_path: Path) -> str:
     slope_tif = data_dir / "slope.tif"
     parts = (
-        "georef_v1",
+        "georef_v2",
         str(data_dir),
+        str(model_path),
+        model_path.stat().st_mtime_ns,
         cfg.grid_h,
         cfg.grid_w,
         cfg.projected_crs,
         cfg.geographic_crs,
-        cfg.lssvm_gamma,
-        cfg.lssvm_sigma,
-        training_csv.stat().st_mtime_ns if training_csv.exists() else 0,
         slope_tif.stat().st_mtime_ns if slope_tif.exists() else 0,
     )
     raw = json.dumps(parts, sort_keys=True).encode("utf-8")
@@ -486,7 +480,7 @@ def build_simulation(cfg: SimConfig):
     if not data_dir.is_dir():
         raise FileNotFoundError(f"Data directory not found: {data_dir}")
 
-    for fname in ("slope.tif", "aspect.tif", "elevation.tif", "ndvi.tif", "humidity.tif", "training_samples.csv"):
+    for fname in ("slope.tif", "aspect.tif", "elevation.tif", "ndvi.tif", "humidity.tif"):
         if not (data_dir / fname).is_file():
             raise FileNotFoundError(f"Missing required input file: {data_dir / fname}")
 
@@ -510,12 +504,11 @@ def build_simulation(cfg: SimConfig):
     if not wind_t0.is_dir():
         raise FileNotFoundError(f"Wind processing failed; expected directory not found: {wind_t0}")
 
-    terrain, X_train, y_train = load_gee_data(
+    terrain = load_gee_rasters(
         data_dir=str(data_dir),
         projected_crs=cfg.projected_crs,
         target_shape=(cfg.grid_h, cfg.grid_w),
     )
-    _validate_training_data(X_train, y_train)
 
     features = terrain["features"]
     unburnable = terrain["unburnable_mask"].astype(bool)
@@ -524,98 +517,42 @@ def build_simulation(cfg: SimConfig):
     grid_crs = terrain["grid_crs"]
 
     h, w = int(features.shape[1]), int(features.shape[2])
-    cache_key = _model_cache_key(cfg, data_dir)
-    model_path = CACHE_DIR / f"lssvm_{cache_key}.npz"
-    pc_path = CACHE_DIR / f"pc_{cache_key}.npy"
-    metrics_path = CACHE_DIR / f"metrics_{cache_key}.json"
 
-    if cache_key in _mem_cache:
-        model, Pc, base_meta = _mem_cache[cache_key]
-        cache_src = "memory"
-    elif model_path.exists() and pc_path.exists():
-        t0 = time.time()
-        model = LSSVM.load(model_path)
-        Pc = np.load(pc_path).astype(np.float32)
-        if Pc.shape != (h, w):
-            raise ValueError(
-                f"Cached probability grid has shape {Pc.shape}, expected {(h, w)}. "
-                "Delete .model_cache to rebuild."
-            )
-
-        if metrics_path.exists():
-            with metrics_path.open("r", encoding="utf-8") as fh:
-                base_meta = json.load(fh)
-        else:
-            base_meta = {}
-
-        base_meta["cache_load_time_s"] = round(time.time() - t0, 3)
-        _mem_cache[cache_key] = (model, Pc, base_meta)
-        cache_src = "disk"
-    else:
-        X_fit, y_fit, X_val, y_val = _stratified_train_val_split(
-            X_train,
-            y_train,
-            val_ratio=0.2,
-            seed=cfg.ca_seed,
+    model_path = _resolve_path(backend_dir, cfg.lssvm_model_path)
+    resolved_model_path = model_path if model_path.exists() else model_path.with_suffix(".npz")
+    if not resolved_model_path.is_file():
+        raise FileNotFoundError(
+            "Configured LSSVM model not found. "
+            f"Expected at {resolved_model_path}. "
+            "Run train_lssvm.py first to create it."
         )
 
-        t0 = time.time()
-        model = LSSVM(gamma=cfg.lssvm_gamma, sigma=cfg.lssvm_sigma)
-        model.fit(X_fit, y_fit)
-        train_time = time.time() - t0
+    t0 = time.time()
+    model = LSSVM.load(resolved_model_path)
+    model_load_time = time.time() - t0
 
-        Pc = model.compute_probability_surface(features)
+    Pc = model.compute_probability_surface(features)
+    cache_key = _model_cache_key(cfg, data_dir, resolved_model_path)
 
-        y_fit_pred = model.predict(X_fit)
-        y_fit_score = model.predict_proba(X_fit)
-        m_train = _classification_metrics(y_fit, y_fit_pred, y_fit_score)
+    metrics_path = resolved_model_path.with_suffix(".metrics.json")
+    if metrics_path.is_file():
+        with metrics_path.open("r", encoding="utf-8") as fh:
+            loaded_meta = json.load(fh)
+        base_meta = loaded_meta if isinstance(loaded_meta, dict) else {}
+    else:
+        base_meta = {}
 
-        if X_val is not None and y_val is not None and len(y_val) > 0:
-            y_val_pred = model.predict(X_val)
-            y_val_score = model.predict_proba(X_val)
-            m_val = _classification_metrics(y_val, y_val_pred, y_val_score)
-        else:
-            m_val = None
-
-        base_meta = {
-            "total_samples": int(len(y_train)),
-            "train_samples": int(len(y_fit)),
-            "val_samples": 0 if y_val is None else int(len(y_val)),
-            "train_fire": int((y_fit == 1).sum()),
-            "train_nofire": int((y_fit == -1).sum()),
-            "val_fire": 0 if y_val is None else int((y_val == 1).sum()),
-            "val_nofire": 0 if y_val is None else int((y_val == -1).sum()),
-            "train_time_s": round(train_time, 3),
-            "train_accuracy": round(m_train["accuracy"], 4),
-            "fire_accuracy": round(m_train["recall"], 4),
-            "nofire_accuracy": round(m_train["specificity"], 4),
-            "train_precision": round(m_train["precision"], 4),
-            "train_recall": round(m_train["recall"], 4),
-            "train_specificity": round(m_train["specificity"], 4),
-            "train_f1": round(m_train["f1"], 4),
-            "train_balanced_accuracy": round(m_train["balanced_accuracy"], 4),
-            "train_roc_auc": None if m_train["roc_auc"] is None else round(m_train["roc_auc"], 4),
-            "val_accuracy": None if m_val is None else round(m_val["accuracy"], 4),
-            "val_precision": None if m_val is None else round(m_val["precision"], 4),
-            "val_recall": None if m_val is None else round(m_val["recall"], 4),
-            "val_specificity": None if m_val is None else round(m_val["specificity"], 4),
-            "val_f1": None if m_val is None else round(m_val["f1"], 4),
-            "val_balanced_accuracy": None if m_val is None else round(m_val["balanced_accuracy"], 4),
-            "val_roc_auc": None if m_val is None or m_val["roc_auc"] is None else round(m_val["roc_auc"], 4),
-            "val_tp": None if m_val is None else int(m_val["tp"]),
-            "val_tn": None if m_val is None else int(m_val["tn"]),
-            "val_fp": None if m_val is None else int(m_val["fp"]),
-            "val_fn": None if m_val is None else int(m_val["fn"]),
+    base_meta.update(
+        {
+            "lssvm_model_path": str(resolved_model_path),
+            "lssvm_metrics_path": str(metrics_path) if metrics_path.is_file() else None,
+            "model_load_time_s": round(model_load_time, 3),
+            "lssvm_gamma": float(model.gamma),
+            "lssvm_sigma": float(model.sigma),
             "lssvm_b": round(float(model.b or 0.0), 4),
         }
-
-        model.save(model_path)
-        np.save(pc_path, Pc)
-        with metrics_path.open("w", encoding="utf-8") as fh:
-            json.dump(base_meta, fh)
-
-        _mem_cache[cache_key] = (model, Pc, base_meta)
-        cache_src = "trained"
+    )
+    cache_src = "pretrained"
 
     Pc = np.asarray(Pc, dtype=np.float32)
     Pc[unburnable] = 0.0

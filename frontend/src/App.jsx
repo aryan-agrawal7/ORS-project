@@ -17,6 +17,12 @@ export default function App() {
   const [showProb, setShowProb] = useState(true);
   const [exportsInfo, setExportsInfo] = useState({});
 
+  const hasTrainMetrics =
+    meta &&
+    typeof meta.train_accuracy === "number" &&
+    typeof meta.fire_accuracy === "number" &&
+    typeof meta.nofire_accuracy === "number";
+
   useEffect(() => {
     cellSizeRef.current = cellSize;
   }, [cellSize]);
@@ -123,13 +129,19 @@ export default function App() {
         <span><b>Grid:</b> {gridSize.h} x {gridSize.w}</span>
         {meta && (
           <>
-            <span title="LSSVM training time"><b>Train:</b> {meta.train_time_s}s ({meta.train_samples} samples)</span>
-            <span title="Overall LSSVM accuracy on training set">
-              <b>Train Acc:</b> {(meta.train_accuracy * 100).toFixed(1)}%
-              <span style={{ fontSize: 11, color: "#666" }}>
-                {" "}(fire: {(meta.fire_accuracy * 100).toFixed(1)}%, non-fire: {(meta.nofire_accuracy * 100).toFixed(1)}%)
-              </span>
+            <span title="LSSVM training time">
+              <b>Train:</b> {meta.train_time_s !== null && meta.train_time_s !== undefined ? `${meta.train_time_s}s` : "n/a"} ({meta.train_samples ?? "n/a"} samples)
             </span>
+            {hasTrainMetrics ? (
+              <span title="Overall LSSVM accuracy on training set">
+                <b>Train Acc:</b> {(meta.train_accuracy * 100).toFixed(1)}%
+                <span style={{ fontSize: 11, color: "#666" }}>
+                  {" "}(fire: {(meta.fire_accuracy * 100).toFixed(1)}%, non-fire: {(meta.nofire_accuracy * 100).toFixed(1)}%)
+                </span>
+              </span>
+            ) : (
+              <span title="Overall LSSVM accuracy on training set"><b>Train Acc:</b> unavailable</span>
+            )}
             {meta.val_accuracy !== null && meta.val_accuracy !== undefined && (
               <span title="Holdout validation metrics (20% stratified split)">
                 <b>Val:</b> acc {(meta.val_accuracy * 100).toFixed(1)}% | rec {(meta.val_recall * 100).toFixed(1)}% | f1 {(meta.val_f1 * 100).toFixed(1)}% | auc {meta.val_roc_auc?.toFixed(3)}
